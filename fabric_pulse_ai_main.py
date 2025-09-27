@@ -215,52 +215,43 @@ def should_send_whatsapp(emp_data: dict, line_performers: List[dict]) -> bool:
     return emp_data.get("efficiency", 0) < threshold_eff
 
 class OllamaAIService:
-    """Ollama AI Service for local llama-3.2:3b integration"""
-    
-    def __init__(self, model: str = "mistral:latest"):
+    """Rewritten AI Service using LlamaIndex (via ollama_client)"""
+
+    def __init__(self, model: str = "meta-llama/llama-4-scout-17b-16e-instruct"):
         self.model = model
-        self.available = self._check_ollama_availability()
-    
-    def _check_ollama_availability(self) -> bool:
-        """Check if Ollama is available and model is installed"""
-        try:
-            result = subprocess.run(['ollama', 'list'], capture_output=True, text=True, timeout=10)
-            return self.model in result.stdout
-        except Exception as e:
-            logger.warning(f"Ollama not available: {e}")
-            return False
-    
+        self.available = True  # Groq-hosted, always available if API key set
+
     async def summarize_text(self, text: str, length: str = "medium") -> str:
-        """Summarize text using Ollama"""
-        if not self.available:
-            return "AI service unavailable. Summary would provide key insights about production efficiency."
-        
-        # Limit input text length
+        # Old subprocess ollama logic preserved as comment
+        # try:
+        #     result = subprocess.run(['ollama', 'run', self.model, prompt], ...)
+        # except Exception as e: ...
+        if not text:
+            return "No input text provided."
         text = text[:10000]
-        
         length_prompts = {
             "short": "Provide a brief 1-2 sentence summary",
             "medium": "Provide a concise paragraph summary", 
             "long": "Provide a detailed summary with key points"
         }
-        
-        length_instruction = length_prompts.get(length, length_prompts["medium"])
-        
-        prompt = f"{length_instruction} of the following production data:\\n\\n{text}\\n\\nSummary:"
-        
-        try:
-            result = subprocess.run([
-                'ollama', 'run', self.model, prompt
-            ], capture_output=True, text=True, timeout=30)
-            
-            if result.returncode == 0 and result.stdout.strip():
-                return result.stdout.strip()
-            else:
-                return "Unable to generate summary at this time."
-        
-        except Exception as e:
-            logger.error(f"Ollama summarization failed: {e}")
-            return "AI summarization service temporarily unavailable."
+        prompt = f"{length_prompts.get(length,'medium')}:\n{text}\nSummary:"
+        req = AIRequest(prompt=prompt, max_tokens=300)
+        async for out in ollama_client.generate_completion(req):
+            return out
+        return "No summary generated."
+
+    async def suggest_operations(self, context: str, query: str):
+        # Old subprocess JSON parsing kept as comment
+        # try: subprocess.run(['ollama', ...])
+        return await ollama_client.suggest_operations(context, query)
+
+    async def generate_completion(self, prompt: str, max_tokens: int = 200) -> str:
+        if not prompt:
+            return "Empty prompt."
+        req = AIRequest(prompt=prompt, max_tokens=max_tokens)
+        async for out in ollama_client.generate_completion(req):
+            return out
+        return "No completion generated."
     
     async def suggest_operations(self, context: str, query: str) -> List[Dict[str, Any]]:
         """Suggest operations based on context and query"""
@@ -270,16 +261,16 @@ class OllamaAIService:
         context = context[:8000]  # Limit context length
         
         prompt = f"""
-Based on the following garment manufacturing context and user query, suggest relevant operations.
-Respond with a JSON array of operations, each with id, label, and confidence (0.0-1.0).
+                Based on the following garment manufacturing context and user query, suggest relevant operations.
+                Respond with a JSON array of operations, each with id, label, and confidence (0.0-1.0).
 
-Context: {context}
-Query: {query}
+                Context: {context}
+                Query: {query}
 
-Example operations: Cutting, Sewing, Hemming, Buttonhole, Collar attachment, Sleeve attachment, Quality checking, Pressing, Folding, Packaging
+                Example operations: Cutting, Sewing, Hemming, Buttonhole, Collar attachment, Sleeve attachment, Quality checking, Pressing, Folding, Packaging
 
-Respond only with valid JSON array:
-"""
+                Respond only with valid JSON array:
+                """
         
         try:
             result = subprocess.run([

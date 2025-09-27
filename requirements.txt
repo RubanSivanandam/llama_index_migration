@@ -1,72 +1,52 @@
-# A fast web framework
+# -----------------------------
+# Web Frameworks & Servers
+# -----------------------------
 fastapi==0.104.1
-# An ASGI server for FastAPI
 uvicorn[standard]==0.24.0
-# For handling form data in FastAPI
 python-multipart==0.0.6
-# A modern HTTP client
 httpx==0.28.1
-# A simple HTTP library
 requests==2.31.0
-# For writing concurrent code
-asyncio
-# Another standard HTTP server
-uvicorn
 
+# -----------------------------
 # Data & Database Management
-# SQL toolkit and ORM
+# -----------------------------
 sqlalchemy==2.0.23
-# ODBC driver for databases
 pyodbc==5.0.1
-# Data analysis library
 pandas==2.1.3
-# Numerical operations
 numpy==1.26.4
-# Extensions for datetime objects
 python-dateutil==2.8.2
-# Windows-specific system APIs
-pywin32==306
+pywin32==306 ; sys_platform == "win32"
 
+# -----------------------------
 # AI, Machine Learning & NLP
-# Hugging Face models library
-transformers==4.35.2
-# Core PyTorch library
-torch==2.4.1
-# Classic ML algorithms
+# -----------------------------
+transformers==4.43.3 
 scikit-learn==1.5.2
-# LLM application framework
-llama-index==0.11.15
-# OpenAI-compatible embeddings adapter
-llama-index-embeddings-openai==0.2.4
-# OpenAI-compatible LLM adapter
-llama-index-llms-openai==0.2.10
-# Groq API SDK
 groq==0.11.0
+llama-index-core==0.14.3
+llama-index-llms-groq==0.4.1
 
+
+
+# -----------------------------
 # General Utilities & Automation
-# For SMS, voice, and video
+# -----------------------------
 twilio==8.10.0
-# For loading environment variables
 python-dotenv==1.0.0
-# Data validation and settings management
-pydantic==2.8.2
-# Simple job scheduler
+pydantic==2.11.5
 schedule==1.2.0
-# Provides colored log output
 colorlog==6.7.0
 
+# -----------------------------
 # Testing & Development Tools
-# Test framework
+# -----------------------------
 pytest==7.4.3
-# Code formatter
 black==23.11.0
-# Cryptographic primitives
 cryptography==41.0.7
 
+# -----------------------------
 # Reporting & Visualization
-# PDF document generation
+# -----------------------------
 reportlab==4.0.4
-# Data visualization
 matplotlib==3.9.2
-# Statistical graphics
 seaborn==0.12.0
