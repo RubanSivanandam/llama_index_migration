@@ -17,7 +17,8 @@ from collections import defaultdict
 import time
 import threading
 # import tempfile
-from ollama_client import ollama_client
+from ollama_client import OllamaClient, AIRequest
+ollama_client = OllamaClient()
 from sympy import sqf
 from ultra_advanced_chatbot import UltraHighPerformanceChatbot, make_ultra_advanced_pdf_report
 from ultra_advanced_chatbot import ultra_high_performance_chatbot, make_ultra_advanced_pdf_report
@@ -214,32 +215,20 @@ def should_send_whatsapp(emp_data: dict, line_performers: List[dict]) -> bool:
     return emp_data.get("efficiency", 0) < threshold_eff
 
 class OllamaAIService:
-    """Backwards-compatible AI service now backed by Groq via LlamaIndex."""
-    def __init__(self, model: str = None):
+    """Ollama AI Service for local llama-3.2:3b integration"""
+    
+    def __init__(self, model: str = "mistral:latest"):
         self.model = model
-
-    async def summarize_text(self, text: str, length: str = "medium") -> str:
-        base = (
-            "You are a manufacturing efficiency analyst. "
-            f"Write a {length} summary with quantified KPIs and actions.\n\n"
-        )
-        return await ollama_client.summarize_text()
-
-    async def suggest_operations(self, context: str, query: str):
-        return await ollama_client.suggest_operations(context=context, query=query)
-
-    async def generate_completion(self, prompt: str, max_tokens: int = 200) -> str:
-        from pydantic import BaseModel
-        class _Req(BaseModel):
-            prompt: str
-            max_tokens: int = 200
-            temperature: float = 0.7
-            stream: bool = False
-        text = ""
-        req = _Req(prompt=prompt, max_tokens=max_tokens)
-        async for chunk in ollama_client.generate_completion(req):
-            text += chunk
-        return text
+        self.available = self._check_ollama_availability()
+    
+    def _check_ollama_availability(self) -> bool:
+        """Check if Ollama is available and model is installed"""
+        try:
+            result = subprocess.run(['ollama', 'list'], capture_output=True, text=True, timeout=10)
+            return self.model in result.stdout
+        except Exception as e:
+            logger.warning(f"Ollama not available: {e}")
+            return False
     
     async def summarize_text(self, text: str, length: str = "medium") -> str:
         """Summarize text using Ollama"""
@@ -521,6 +510,7 @@ class EnhancedRTMSEngine:
         floor_name: Optional[str] = None,
         line_name: Optional[str] = None,
         operation: Optional[str] = None,
+        part_name: Optional[str] = None,
         limit: int = 1000
     ) -> List[RTMSProductionData]:
         """Fetch production data with optional filtering - FIXED DATE QUERY"""
@@ -560,6 +550,9 @@ class EnhancedRTMSEngine:
             if operation:
                 query += " AND [NewOperSeq] = @operation"
                 params["operation"] = operation
+            if part_name:
+                query += " AND [PartName] = @part_name"
+                params["part_name"] = part_name
             
             query += " ORDER BY [TranDate] DESC"
             
@@ -1247,6 +1240,33 @@ async def get_operations(unit_code: str = Query(None), floor_name: str = Query(N
         logger.error(f"Failed to fetch operations: {e}")
         raise HTTPException(status_code=500, detail="Failed to fetch operations")
 
+@router.get("/api/rtms/filters/parts")
+async def get_parts(
+    unit_code: str = Query(...),
+    floor_name: str = Query(...),
+    line_name: str = Query(...)
+):
+    try:
+        query = text("""
+            SELECT DISTINCT [PartName]
+            FROM [ITR_PRO_IND].[dbo].[RTMS_SessionWiseProduction]
+            WHERE [UnitCode] = :unit_code
+              AND [FloorName] = :floor_name
+              AND [LineName] = :line_name
+              AND [PartName] IS NOT NULL AND [PartName] != ''
+            ORDER BY [PartName]
+        """)
+        with rtms_engine.engine.connect() as connection:
+            df = pd.read_sql(query, connection, params={
+                "unit_code": unit_code,
+                "floor_name": floor_name,
+                "line_name": line_name
+            })
+        return {"status": "success", "data": df['PartName'].tolist()}
+    except Exception as e:
+        logger.error(f"Failed to fetch parts: {e}")
+        return {"status": "error", "data": [], "message": str(e)}
+
 # FIXED: Added missing analyze endpoint that frontend expects
 @app.get("/api/rtms/analyze")
 async def analyze_production_data(
@@ -1290,6 +1310,7 @@ async def get_operator_efficiencies(
     floor_name: Optional[str] = Query(None),
     line_name: Optional[str] = Query(None),
     operation: Optional[str] = Query(None),
+    part_name: Optional[str] = Query(None),
     limit: int = Query(1000, ge=1, le=5000)
 ):
     """Get operator efficiency analysis with AI insights"""
@@ -1300,6 +1321,7 @@ async def get_operator_efficiencies(
             floor_name=floor_name,
             line_name=line_name,
             operation=operation,
+            part_name=part_name,
             limit=limit
         )
         
@@ -1319,6 +1341,44 @@ async def get_operator_efficiencies(
     except Exception as e:
         logger.error(f"Failed to get operator efficiencies: {e}")
         raise HTTPException(status_code=500, detail="Failed to get operator efficiencies")
+@router.get("/api/rtms/flagged")
+async def get_flagged_employees(
+    unit_code: Optional[str] = Query(None),
+    floor_name: Optional[str] = Query(None),
+    line_name: Optional[str] = Query(None),
+    part_name: Optional[str] = Query(None)
+):
+    try:
+        query = """
+            SELECT EmpName, EmpCode, UnitCode, FloorName, LineName, StyleNo,
+                   PartName, Operation, NewOperSeq, ProdnPcs, Eff100, EffPer, IsRedFlag
+            FROM [ITR_PRO_IND].[dbo].[RTMS_SessionWiseProduction]
+            WHERE CAST(TranDate AS DATE) = CAST(GETDATE() AS DATE)
+              AND IsRedFlag = 1
+              AND EmpName IS NOT NULL
+              AND LineName IS NOT NULL
+        """
+        params = {}
+        if unit_code:
+            query += " AND UnitCode = @unit_code"
+            params["unit_code"] = unit_code
+        if floor_name:
+            query += " AND FloorName = @floor_name"
+            params["floor_name"] = floor_name
+        if line_name:
+            query += " AND LineName = @line_name"
+            params["line_name"] = line_name
+        if part_name:
+            query += " AND PartName = @part_name"
+            params["part_name"] = part_name
+        query += " ORDER BY LineName, StyleNo, EmpName"
+
+        with rtms_engine.engine.connect() as conn:
+            df = pd.read_sql(text(query), conn, params=params)
+        return {"status": "success", "data": df.to_dict(orient="records")}
+    except Exception as e:
+        logger.error(f"Failed to fetch flagged: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 # Health check
 @app.get("/health")
@@ -1977,19 +2037,22 @@ Acts like ChatGPT (smooth typing animation in frontend).
 #             "records_used": len(df),
 #             "enhancement_level": "fallback_mode"
 #         }
-@router.post("/test_whatsapp_alerts")
-async def test_whatsapp_alerts(test_mode: bool = True):
+@router.post("/api/rtms/test_whatsapp_alerts")
+async def test_whatsapp_alerts():
     """
-    Test endpoint to send sample WhatsApp alerts.
-    test_mode=True → sends only to DEFAULT_TEST_NUMBERS (mock or Twilio sandbox)
+    Test endpoint:
+    - Runs full WhatsApp send cycle in normal mode
+    - Saves PDF, CSV, .txt mocks, .json mocks for every supervisor
+    - Returns JSON summary
     """
     try:
-        results = await whatsapp_service.generate_and_send_reports(test_mode=test_mode)
-        return {"status": "success", "results": results}
+        result = await whatsapp_service.generate_and_send_reports(
+            test_mode=False,
+            save_artifacts=True   # ✅ Explicitly save artifacts for test API
+        )
+        return {"status": "ok", "result": result}
     except Exception as e:
-        logger.error(f"test_whatsapp_alerts failed: {e}", exc_info=True)
-        return {"status": "error", "reason": str(e)}
-
+        return {"status": "error", "message": str(e)}
 
 from ollama_client import ollama_client  # AI service
 logger = logging.getLogger("ai_api")
@@ -2308,15 +2371,12 @@ async def predict_efficiency(request: PredictEfficiencyRequest):
 
 
 # ================== ULTRA CHATBOT ==================
-#@router.post("/api/ai/ultra_chatbot", methods=["GET", "POST"])
-#@app.api_route("/api/ai/ultra_chatbot", methods=["GET", "POST"])
-@app.post("/api/ai/ultra_chatbot")
+@router.post("/api/ai/ultra_chatbot")
 async def ultra_advanced_ai_chatbot(request: UltraChatRequest):
     try:
-            
         # Get cached dataframe (loaded at refresh time)
         df = AI_CACHE.get("chatbot_data")
-        logger.error(f"Ultra chatbot entered: ", exc_info=True)
+
         # Context: lightweight only (no heavy aggregation)
         if df is not None and not df.empty:
             context = (
@@ -2385,11 +2445,14 @@ Remember: Be concise, professional, and focused on real-time production improvem
         raise HTTPException(status_code=500, detail="Chatbot error")
 
 if __name__ == "__main__":
-    logger.info("🚀 Starting Fabric Pulse AI Backend...")
+    # ✅ Start WhatsApp scheduler (5 min interval, auto WhatsApp trigger)
+
+
+    logger.info("🚀 Starting Unified Fabric Pulse AI Backend (with aliases)...")
     uvicorn.run(
-        "fabric_pulse_ai_main:app",
+        "main:app",
         host="0.0.0.0",
         port=8000,
         reload=False,
-        log_level="info"
+        log_level="info",
     )

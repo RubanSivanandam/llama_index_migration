@@ -11,13 +11,16 @@ from ai_routes import router as ai_router
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
+import threading
 
 # Import config + routers
+from whatsapp_service import whatsapp_service
 from config import config
 from fabric_pulse_ai_main import (
     cache_status,
     generate_hourly_report,
     generate_pdf_report_api,
+    get_parts,
     predict_efficiency,
     refresh_ai_cache,
     rtms_engine,
@@ -83,6 +86,7 @@ app.get("/api/rtms/filters/units")(get_unit_codes)
 app.get("/api/rtms/filters/floors")(get_floor_names)
 app.get("/api/rtms/filters/lines")(get_line_names)
 app.get("/api/rtms/filters/operations")(get_operations)
+app.get("/api/rtms/filters/parts")(get_parts)
 app.get("/api/rtms/analyze")(analyze_production_data)
 app.get("/api/rtms/efficiency")(get_operator_efficiencies)
 app.get("/api/ai/generate_hourly_report")(generate_hourly_report)
@@ -95,6 +99,17 @@ app.get("/api/ai/rtms/operators")(get_operator_efficiencies)
 app.get("/api/ai/rtms/lines")(get_line_names)
 app.post("/api/ai/predict_efficiency")(predict_efficiency)
 app.post("/api/ai/ultra_chatbot")(ultra_advanced_ai_chatbot)  # New chatbot endpoint
+
+
+def start_scheduler():
+    try:
+        whatsapp_service.start_scheduler()
+        print("✅ WhatsApp scheduler started (5-minute interval)")
+    except Exception as e:
+        print(f"❌ Failed to start WhatsApp scheduler: {e}")
+
+# Run scheduler in background thread at startup
+threading.Thread(target=start_scheduler, daemon=True).start()
 
 if __name__ == "__main__":
     logger.info("🚀 Starting Unified Fabric Pulse AI Backend (with aliases)...")

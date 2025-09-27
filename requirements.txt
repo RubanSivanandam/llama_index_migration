@@ -1,6 +1,3 @@
-Of course, here is the list of packages and their descriptions in a plain text format, suitable for a `requirements.txt` file with comments.
-
-
 # A fast web framework
 fastapi==0.104.1
 # An ASGI server for FastAPI
@@ -24,7 +21,7 @@ pyodbc==5.0.1
 # Data analysis library
 pandas==2.1.3
 # Numerical operations
-numpy==1.25.2
+numpy==1.26.4
 # Extensions for datetime objects
 python-dateutil==2.8.2
 # Windows-specific system APIs
@@ -34,15 +31,15 @@ pywin32==306
 # Hugging Face models library
 transformers==4.35.2
 # Core PyTorch library
-torch==2.1.0
+torch==2.4.1
 # Classic ML algorithms
-scikit-learn==1.3.0
+scikit-learn==1.5.2
 # LLM application framework
 llama-index==0.11.15
 # OpenAI-compatible embeddings adapter
-llama-index-embeddings-openai==0.2.3
+llama-index-embeddings-openai==0.2.4
 # OpenAI-compatible LLM adapter
-llama-index-llms-openai==0.2.7
+llama-index-llms-openai==0.2.10
 # Groq API SDK
 groq==0.11.0
 
@@ -52,7 +49,7 @@ twilio==8.10.0
 # For loading environment variables
 python-dotenv==1.0.0
 # Data validation and settings management
-pydantic==2.5.0
+pydantic==2.8.2
 # Simple job scheduler
 schedule==1.2.0
 # Provides colored log output
@@ -70,6 +67,6 @@ cryptography==41.0.7
 # PDF document generation
 reportlab==4.0.4
 # Data visualization
-matplotlib==3.7.0
+matplotlib==3.9.2
 # Statistical graphics
 seaborn==0.12.0
