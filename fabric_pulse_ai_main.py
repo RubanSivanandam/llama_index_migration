@@ -16,7 +16,9 @@ from dataclasses import dataclass, asdict
 from collections import defaultdict
 import time
 import threading
-# import tempfile
+from llm_provider import get_llm
+groq_client = get_llm()
+# import tempfiles
 from ollama_client import OllamaClient, AIRequest
 ollama_client = OllamaClient()
 from sympy import sqf
@@ -53,6 +55,19 @@ import urllib.parse
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
 from ultra_advanced_chatbot import ultra_chatbot, make_ultra_advanced_pdf_report
+from dotenv import load_dotenv  
+load_dotenv()
+
+router = APIRouter()
+
+# ---- Database Config from .env ----
+DB_SERVER = os.getenv("DB_SERVER")
+DB_DATABASE = os.getenv("DB_DATABASE")
+DB_USERNAME = os.getenv("DB_USERNAME")
+DB_PASSWORD = os.getenv("DB_PASSWORD")
+
+# ---- Groq API Key ----
+groq_api_key = os.getenv("GROQ_API_KEY")
 
 import warnings
 TEST_NUMBERS = ["+919943625493", "+918939990949"]
@@ -343,7 +358,7 @@ class OllamaAIService:
         except Exception as e:
             logger.error(f"Ollama completion failed: {e}", exc_info=True)
             return "AI completion service temporarily unavailable."
-
+        
 # Move format_prediction_text to module level
 def format_prediction_text(ai_prediction: dict, horizon: int) -> str:
     lines = []
@@ -1295,81 +1310,308 @@ async def analyze_production_data(
         logger.error(f"Failed to analyze production data: {e}")
         raise HTTPException(status_code=500, detail="Failed to analyze production data")
 
-@app.get("/api/rtms/efficiency")
-async def get_operator_efficiencies(
-    unit_code: Optional[str] = Query(None),
-    floor_name: Optional[str] = Query(None),
-    line_name: Optional[str] = Query(None),
-    operation: Optional[str] = Query(None),
-    part_name: Optional[str] = Query(None),
-    limit: int = Query(1000, ge=1, le=5000)
+@router.get("/api/rtms/efficiency")
+async def get_efficiency_summary(
+    unit_code: str = Query(..., description="Unit code"),
+    floor_name: str = Query(..., description="Floor name"),
+    line_name: str = Query(..., description="Line name"),
+    part_name: str = Query(..., description="Part name"),
 ):
-    """Get operator efficiency analysis with AI insights"""
+    """
+    Cards data + underperformers (NoOfOperators) using CTE.
+    Date is FIXED to 2025-09-29 (for testing).
+    """
     try:
-        # Fetch production data
-        data = await rtms_engine.fetch_production_data(
-            unit_code=unit_code,
-            floor_name=floor_name,
-            line_name=line_name,
-            operation=operation,
-            part_name=part_name,
-            limit=limit
+        if not rtms_engine or not rtms_engine.engine:
+            raise HTTPException(status_code=500, detail="DB engine not available")
+
+        # Use a fixed date instead of GETDATE()
+        fixed_date = "2025-09-29"
+
+        cte_sql = text(f"""
+        ;WITH OperationDetails AS (
+            SELECT 
+                A.ReptType, 
+                A.UnitCode,
+                A.TranDate,
+                A.LineName,
+                B.SupervisorName,
+                B.SupervisorCode,
+                B.PhoneNumber,
+                A.PartName,
+                A.PartSeq,
+                SUM(A.PRODNPCS) AS ProdPcs,
+                COUNT(*) AS NoofOprs
+            FROM RTMS_SessionWiseProduction A
+            JOIN RTMS_SupervisorsDetl B
+                ON A.LineName = B.LineName
+               AND A.PartName = B.PartName
+            WHERE 
+                A.UnitCode = :unit_code
+                AND A.FloorName = :floor_name
+                AND A.LineName = :line_name
+                AND A.PartName = :part_name
+                AND CAST(A.TranDate AS DATE) = '{fixed_date}'
+                AND A.ReptType = 'RTM$'
+                AND A.ISFinPart = 'Y'
+            GROUP BY 
+                A.ReptType,
+                A.UnitCode,
+                A.TranDate,
+                A.LineName,
+                B.SupervisorName,
+                B.SupervisorCode,
+                B.PhoneNumber,
+                A.PartName,
+                A.PartSeq
+        ),
+        OperationSummary AS (
+            SELECT 
+                ReptType,
+                TranDate,
+                LineName,
+                PartSeq,
+                PartName,
+                Operation,
+                SUM(ProdnPcs) AS OperProd,
+                COUNT(DISTINCT EmpCode) AS NoofOperators,
+                ISFinPart
+            FROM dbo.RTMS_SessionWiseProduction 
+            WHERE CAST(TranDate AS DATE) = '{fixed_date}'
+              AND ReptType = 'RTM$'
+              AND UnitCode = :unit_code
+              AND FloorName = :floor_name
+              AND LineName = :line_name
+              AND PartName = :part_name
+            GROUP BY ReptType, TranDate, LineName, PartSeq, PartName, Operation, ISFinPart
+        ),
+        MaxProdPerPart AS (
+            SELECT 
+                ReptType,
+                TranDate,
+                LineName,
+                PartSeq,
+                PartName,
+                ISFinPart,
+                MAX(OperProd) AS MaxProd
+            FROM OperationSummary
+            GROUP BY ReptType, TranDate, LineName, PartSeq, PartName, ISFinPart
+        ),
+        LowPerformers AS (
+            SELECT 
+                a.ReptType,
+                a.TranDate,
+                a.LineName,
+                a.PartSeq,
+                a.PartName,
+                a.Operation,
+                a.OperProd,
+                b.MaxProd,
+                a.NoofOperators,
+                ROUND(b.MaxProd * 0.85, 0) AS TargetPcs,
+                ROUND((a.OperProd * 100.0) / b.MaxProd, 2) AS AchvPercent,
+                a.ISFinPart
+            FROM OperationSummary a
+            JOIN MaxProdPerPart b
+                ON a.ReptType = b.ReptType
+               AND a.TranDate = b.TranDate
+               AND a.LineName = b.LineName
+               AND a.PartSeq = b.PartSeq
+               AND a.PartName = b.PartName
+            WHERE a.OperProd < b.MaxProd * 0.85
+              AND a.ISFinPart = 'Y'
+        ),
+        SummaryTable AS (
+            SELECT 
+                ReptType,
+                TranDate,
+                LineName,
+                PartSeq,
+                PartName,
+                MAX(TargetPcs) AS TargetPcs,
+                MAX(AchvPercent) AS AchvPercent
+            FROM LowPerformers
+            GROUP BY ReptType, TranDate, LineName, PartSeq, PartName
         )
-        
-        # Process analysis
-        analysis = rtms_engine.process_efficiency_analysis(data)
-        
-        return {
-            "status": "success",
-            "data": analysis,
-            "filters_applied": {
+        SELECT 
+            OD.ReptType, OD.UnitCode, OD.TranDate, OD.LineName,
+            OD.SupervisorName, OD.SupervisorCode, OD.PhoneNumber,
+            OD.PartName, OD.PartSeq, OD.ProdPcs, OD.NoofOprs,
+            ST.TargetPcs, ST.AchvPercent
+        FROM OperationDetails OD
+        JOIN SummaryTable ST
+            ON OD.TranDate = ST.TranDate
+           AND OD.LineName = ST.LineName
+           AND OD.PartName = ST.PartName
+           AND OD.ReptType = ST.ReptType
+        ORDER BY OD.LineName, OD.PartSeq;
+        """)
+
+        detail_sql = text(f"""
+        SELECT 
+            A.EmpCode, A.EmpName, A.LineName, A.PartName,
+            A.NewOperSeq AS Operation, 
+            A.ProdnPcs AS Production,
+            A.Eff100   AS Target,
+            CASE WHEN A.Eff100 > 0 THEN (A.ProdnPcs * 100.0) / A.Eff100 ELSE 0 END AS Efficiency,
+            B.SupervisorName, B.SupervisorCode, B.PhoneNumber
+        FROM RTMS_SessionWiseProduction A
+        JOIN RTMS_SupervisorsDetl B
+          ON A.LineName = B.LineName AND A.PartName = B.PartName
+        WHERE A.ReptType = 'RTM$'
+          AND CAST(A.TranDate AS DATE) = '{fixed_date}'
+          AND A.UnitCode = :unit_code
+          AND A.FloorName = :floor_name
+          AND A.LineName = :line_name
+          AND A.PartName = :part_name
+          AND A.ISFinPart = 'Y'
+        """)
+
+        with rtms_engine.engine.connect() as conn:
+            df_cte = pd.read_sql(cte_sql, conn, params={
                 "unit_code": unit_code,
                 "floor_name": floor_name,
                 "line_name": line_name,
-                "operation": operation
-            }
-        }
-    except Exception as e:
-        logger.error(f"Failed to get operator efficiencies: {e}")
-        raise HTTPException(status_code=500, detail="Failed to get operator efficiencies")
-@router.get("/api/rtms/flagged")
-async def get_flagged_employees(
-    unit_code: Optional[str] = Query(None),
-    floor_name: Optional[str] = Query(None),
-    line_name: Optional[str] = Query(None),
-    part_name: Optional[str] = Query(None)
-):
-    try:
-        query = """
-            SELECT EmpName, EmpCode, UnitCode, FloorName, LineName, StyleNo,
-                   PartName, Operation, NewOperSeq, ProdnPcs, Eff100, EffPer, IsRedFlag
-            FROM [ITR_PRO_IND].[dbo].[RTMS_SessionWiseProduction]
-            WHERE CAST(TranDate AS DATE) = CAST(GETDATE() AS DATE)
-              AND IsRedFlag = 1
-              AND EmpName IS NOT NULL
-              AND LineName IS NOT NULL
-        """
-        params = {}
-        if unit_code:
-            query += " AND UnitCode = @unit_code"
-            params["unit_code"] = unit_code
-        if floor_name:
-            query += " AND FloorName = @floor_name"
-            params["floor_name"] = floor_name
-        if line_name:
-            query += " AND LineName = @line_name"
-            params["line_name"] = line_name
-        if part_name:
-            query += " AND PartName = @part_name"
-            params["part_name"] = part_name
-        query += " ORDER BY LineName, StyleNo, EmpName"
+                "part_name": part_name
+            })
+            df_emp = pd.read_sql(detail_sql, conn, params={
+                "unit_code": unit_code,
+                "floor_name": floor_name,
+                "line_name": line_name,
+                "part_name": part_name
+            })
 
-        with rtms_engine.engine.connect() as conn:
-            df = pd.read_sql(text(query), conn, params=params)
-        return {"status": "success", "data": df.to_dict(orient="records")}
+        total_production = int(df_cte["ProdPcs"].sum()) if not df_cte.empty else 0
+        total_target = int(df_cte["TargetPcs"].sum()) if not df_cte.empty else 0
+        efficiency = float((total_production / total_target) * 100.0) if total_target > 0 else 0.0
+        underperformers_count = int(df_cte["NoofOprs"].sum()) if not df_cte.empty else 0
+
+        underperformers = []
+        if not df_emp.empty:
+            df_u = df_emp[df_emp["Efficiency"] < 85.0]
+            for _, r in df_u.iterrows():
+                underperformers.append({
+                    "emp_code": str(r.EmpCode),
+                    "emp_name": str(r.EmpName),
+                    "line_name": str(r.LineName),
+                    "part_name": str(r.PartName),
+                    "operation": str(r.Operation) if pd.notna(r.Operation) else None,
+                    "production": int(r.Production) if pd.notna(r.Production) else 0,
+                    "target": int(r.Target) if pd.notna(r.Target) else 0,
+                    "efficiency": float(r.Efficiency) if pd.notna(r.Efficiency) else 0.0,
+                    "supervisor_name": str(r.SupervisorName) if pd.notna(r.SupervisorName) else None,
+                    "supervisor_code": str(r.SupervisorCode) if pd.notna(r.SupervisorCode) else None,
+                    "phone_number": str(r.PhoneNumber) if pd.notna(r.PhoneNumber) else None,
+                })
+
+        return {"success": True, "data": {
+            "total_production": total_production,
+            "total_target": total_target,
+            "efficiency": round(efficiency, 2),
+            "underperformers_count": underperformers_count,
+            "underperformers": underperformers
+        }}
     except Exception as e:
-        logger.error(f"Failed to fetch flagged: {e}")
+        logger.error(f"efficiency endpoint failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/api/rtms/flagged")
+async def get_flagged(
+    unit_code: str = Query(...),
+    floor_name: str = Query(...),
+    line_name: str = Query(...),
+    part_name: str = Query(...)
+):
+    """
+    Return part-wise flagged employees (IsRedFlag = 1) with supervisor join.
+    Always uses today's date automatically.
+    """
+    if not rtms_engine or not rtms_engine.engine:
+        raise HTTPException(status_code=500, detail="DB engine not available")
+
+    # ✅ Always use today's date
+    fixed_date = date.today().strftime("%Y-%m-%d")
+
+    sql = text("""
+        SELECT 
+            A.PartName,
+            A.EmpCode,
+            A.EmpName,
+            A.LineName,
+            A.ProdnPcs AS Production,
+            A.Eff100 AS Target,
+            A.EffPer AS Efficiency,
+            A.NewOperSeq,
+            A.Operation,
+            A.IsRedFlag,
+            B.SupervisorName,
+            B.SupervisorCode,
+            B.PhoneNumber
+        FROM RTMS_SessionWiseProduction A
+        LEFT JOIN RTMS_SupervisorsDetl B
+          ON A.LineName = B.LineName AND A.PartName = B.PartName
+        WHERE CAST(A.TranDate AS DATE) = :fixed_date
+          AND A.ReptType IN ('RTM$', 'RTMS', 'RTM5')
+          AND A.UnitCode = :unit_code
+          AND A.FloorName = :floor_name
+          AND A.LineName = :line_name
+          AND A.PartName = :part_name
+          AND A.IsRedFlag = 1
+    """)
+
+    with rtms_engine.engine.connect() as conn:
+        df = pd.read_sql(sql, conn, params={
+            "fixed_date": fixed_date,
+            "unit_code": unit_code,
+            "floor_name": floor_name,
+            "line_name": line_name,
+            "part_name": part_name
+        })
+
+    if df.empty:
+        return {"success": True, "data": {"parts": []}}
+
+    parts_out = []
+    grp = df.groupby("PartName")
+    for pname, g in grp:
+        employees = []
+        for _, r in g.iterrows():
+            production = int(r.Production) if pd.notna(r.Production) else 0
+            target = int(r.Target) if pd.notna(r.Target) else 0
+
+            efficiency = None
+            if pd.notna(r.Efficiency):
+                try:
+                    efficiency = float(r.Efficiency)
+                except Exception:
+                    efficiency = None
+            if efficiency is None and target > 0:
+                efficiency = round((production / target) * 100.0, 2)
+
+            employees.append({
+                "emp_code": str(r["EmpCode"]) if pd.notna(r["EmpCode"]) else None,
+                "emp_name": str(r["EmpName"]) if pd.notna(r["EmpName"]) else None,
+                # "unit_code": str(r["UnitCode"]) if pd.notna(r["UnitCode"]) else None,
+                # "floor_name": str(r["FloorName"]) if pd.notna(r["FloorName"]) else None,
+                "line_name": str(r["LineName"]) if pd.notna(r["LineName"]) else None,
+                "is_red_flag": int(r["IsRedFlag"]) if pd.notna(r["IsRedFlag"]) else 0,
+                "production": int(r["Production"]) if pd.notna(r["Production"]) else 0,
+                "target": int(r["Target"]) if pd.notna(r["Target"]) else 0,
+                "efficiency": float(r["Efficiency"]) if pd.notna(r["Efficiency"]) else None,
+                "new_oper_seq": str(r["NewOperSeq"]) if pd.notna(r["NewOperSeq"]) else None,
+                "operation": str(r["Operation"]) if pd.notna(r["Operation"]) else None,
+                "supervisor_name": str(r["SupervisorName"]) if pd.notna(r["SupervisorName"]) else None,
+                "supervisor_code": str(r["SupervisorCode"]) if pd.notna(r["SupervisorCode"]) else None,
+                "phone_number": str(r["PhoneNumber"]) if pd.notna(r["PhoneNumber"]) else None,
+            })
+
+        parts_out.append({
+            "part_name": str(pname),
+            "employee_count": len(employees),
+            "employees": employees,
+        })
+
+    return {"success": True, "data": {"parts": parts_out}}
 
 # Health check
 @app.get("/health")
@@ -2362,78 +2604,115 @@ async def predict_efficiency(request: PredictEfficiencyRequest):
 
 
 # ================== ULTRA CHATBOT ==================
+# ---- SQL Server Engine ----
+engine = create_engine(
+    f"mssql+pyodbc://{DB_USERNAME}:{DB_PASSWORD}@{DB_SERVER}/{DB_DATABASE}?driver=ODBC+17+for+SQL+Server"
+)
+
+# ---- Groq Client ----
+
+
+
 @router.post("/api/ai/ultra_chatbot")
-async def ultra_advanced_ai_chatbot(request: UltraChatRequest):
+async def ultra_advanced_ai_chatbot(request: dict):
     try:
-        # Get cached dataframe (loaded at refresh time)
-        df = AI_CACHE.get("chatbot_data")
+        user_query = request.get("query")
+        if not user_query:
+            raise HTTPException(status_code=400, detail="Missing query")
 
-        # Context: lightweight only (no heavy aggregation)
-        if df is not None and not df.empty:
-            context = (
-                f"Dataset has ~{len(df)} records. "
-                f"Key columns: {', '.join(df.columns)}. "
-                f"Important fields: TranDate (date), ProdnPcs (actual production), "
-                f"Eff100 (target), EffPer (efficiency %), LineName, PartName, Supervisor."
-            )
+        # --- Detect production queries ---
+        production_keywords = [
+            "efficiency", "production", "line", "pcs", "target",
+            "effper", "eff100", "trandate", "supervisor", "part", "floor"
+        ]
+        is_production_query = any(kw in user_query.lower() for kw in production_keywords)
+
+        # --- Case A: General AI ---
+        if not is_production_query:
+            final_prompt = f"You are a helpful assistant.\n\nUser query: {user_query}"
         else:
-            context = "No cached production data available."
+            # --- Generate SQL ---
+            sql_system_prompt = """
+            You are a data assistant. Convert natural language questions
+            into SQL queries for SQL Server.
 
-        # --- POWERFUL SYSTEM PROMPT ---
-        business_logic = f"""
-You are a production intelligence assistant for a garment factory.
+            Table: production
+            Columns:
+            - TranDate (date)
+            - ProdnPcs (integer)
+            - Eff100 (integer)
+            - EffPer (float)
+            - LineName (text)
+            - PartName (text)
+            - FloorName (text)
+            - Supervisor (text)
+
+            Rules:
+            - Only return SQL query, no explanation.
+            - Always aggregate or limit rows so result set is small (<10 rows).
+            - Use T-SQL syntax (SQL Server).
+            """
+
+            completion = groq_client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[
+                    {"role": "system", "content": sql_system_prompt},
+                    {"role": "user", "content": user_query}
+                ],
+                temperature=0,
+            )
+            sql_query = completion.choices[0].message["content"].strip()
+
+            # --- Execute SQL ---
+            try:
+                with engine.connect() as conn:
+                    result = pd.read_sql(text(sql_query), conn)
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"SQL execution failed: {e}")
+
+            result_json = result.to_dict(orient="records")
+
+            # --- Business prompt ---
+            final_prompt = f"""
+User asked: {user_query}
+SQL executed: {sql_query}
+Result: {result_json}
+
+You are a garment factory production intelligence assistant.
 
 Responsibilities:
 1. Analyze production data (ProdnPcs, Eff100, EffPer, TranDate, LineName, PartName, Supervisor).
-2. Always detect efficiency trends and PREDICT whether they are improving, declining, or stable.
+2. Detect efficiency trends and PREDICT whether they are improving, declining, or stable.
 3. If efficiency <85%, flag as a RED ALERT and give corrective actions.
 4. If efficiency is 85–95%, classify as ACCEPTABLE but suggest improvements.
 5. If efficiency >95%, classify as EXCELLENT and encourage continuation.
-6. Always explain WHY the trend is happening, not just report numbers.
-7. End every response with 2–3 specific, actionable improvement steps for supervisors.
+6. Always explain WHY the trend is happening.
+7. End with 2–3 specific, actionable supervisor steps.
 8. If no matching data, reply: "No data found for this query, but here are best practices..."
 
 Output format:
 - First line: Direct insight (efficiency %, classification, trend prediction).
 - Next lines: Supporting reasoning (with data if available).
 - Final lines: Recommended actions (bulleted).
-
-Best Practices to Increase Production:
-- Apply lean manufacturing (5S, Just-In-Time, waste reduction).
-- Motivate & train operators; use small incentives.
-- Balance lines, optimize workstation layout to reduce idle time.
-- Automate repetitive tasks; strengthen inline quality control.
-- Encourage continuous feedback between workers and supervisors.
-
-Remember: Be concise, professional, and focused on real-time production improvement.
 """
 
-        # --- Final AI Prompt ---
-        base_prompt = (
-            business_logic
-            + f"\n\nUser query: {request.query}\n\nContext:\n{context}"
-        )
-
-        # --- Streaming AI Response ---
+        # --- Stream response from Groq ---
         async def response_stream():
-            async for frag in ollama_client.stream_chat(
-                model="mistral:latest",
-                messages=[{"role": "user", "content": base_prompt}],
-                options={
-                    "session": AI_CACHE.get("chatbot_session"),
-                    "persist": True,
-                    "temperature": 0.7,
-                    "top_p": 0.9,
-                },
-            ):
-                if frag:
-                    yield frag  # Stream directly, no buffering
+            response = groq_client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[{"role": "user", "content": final_prompt}],
+                temperature=0.4,
+                top_p=0.9,
+                stream=True,
+            )
+            for chunk in response:
+                if chunk.choices[0].delta.content:
+                    yield chunk.choices[0].delta.content
 
         return StreamingResponse(response_stream(), media_type="text/plain")
 
     except Exception as e:
-        logger.error(f"Ultra chatbot failed: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Chatbot error")
+        raise HTTPException(status_code=500, detail=f"Chatbot error: {e}")
 
 if __name__ == "__main__":
     # ✅ Start WhatsApp scheduler (5 min interval, auto WhatsApp trigger)

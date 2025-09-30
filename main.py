@@ -20,6 +20,8 @@ from fabric_pulse_ai_main import (
     cache_status,
     generate_hourly_report,
     generate_pdf_report_api,
+    get_efficiency_summary,
+    get_flagged,
     get_parts,
     predict_efficiency,
     refresh_ai_cache,
@@ -33,7 +35,7 @@ from fabric_pulse_ai_main import (
     get_line_names,
     get_operations,
     analyze_production_data,
-    get_operator_efficiencies,
+    # get_operator_efficiencies,
     health_check,
     test_whatsapp_alerts,
     ultra_advanced_ai_chatbot,
@@ -78,7 +80,7 @@ app.post("/api/ai/summarize")(ai_summarize)
 app.post("/api/ai/suggest_ops")(ai_suggest_operations)
 app.post("/api/ai/completion")(ai_completion)
 app.post("/api/ai/predict_efficiency")(predict_efficiency)
-app.post("/api/ai/refresh_cache")(refresh_ai_cache)
+# app.post("/api/ai/refresh_cache")(refresh_ai_cache)
 app.post("/api/rtms/test_whatsapp_alerts")(test_whatsapp_alerts)
 app.get("/api/ai/refresh_status")(cache_status)
 app.get("/api/status")(get_service_status)
@@ -88,14 +90,15 @@ app.get("/api/rtms/filters/lines")(get_line_names)
 app.get("/api/rtms/filters/operations")(get_operations)
 app.get("/api/rtms/filters/parts")(get_parts)
 app.get("/api/rtms/analyze")(analyze_production_data)
-app.get("/api/rtms/efficiency")(get_operator_efficiencies)
+app.get("/api/rtms/efficiency")(get_efficiency_summary)
 app.get("/api/ai/generate_hourly_report")(generate_hourly_report)
 app.get("/api/reports/hourly_pdf")(generate_pdf_report_api)
+app.get("/api/rtms/flagged")(get_flagged)
 app.get("/health")(health_check)
 
 # 🔗 Aliases so frontend calls like /api/ai/rtms/... work too
 app.get("/api/ai/rtms/overview")(get_service_status)
-app.get("/api/ai/rtms/operators")(get_operator_efficiencies)
+app.get("/api/ai/rtms/operators")(get_efficiency_summary)
 app.get("/api/ai/rtms/lines")(get_line_names)
 app.post("/api/ai/predict_efficiency")(predict_efficiency)
 app.post("/api/ai/ultra_chatbot")(ultra_advanced_ai_chatbot)  # New chatbot endpoint
