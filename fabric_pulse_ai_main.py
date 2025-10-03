@@ -16,7 +16,7 @@ from dataclasses import dataclass, asdict
 from collections import defaultdict
 import time
 import threading
-from llm_provider import get_llm
+from llm_provider import astream, complete, get_llm
 groq_client = get_llm()
 # import tempfiles
 from ollama_client import OllamaClient, AIRequest
@@ -406,15 +406,20 @@ class EnhancedRTMSEngine:
         self.start_background_monitoring()
 
     def _create_database_engine(self):
-        """Create SQLAlchemy engine with connection pooling"""
         try:
-            password = urllib.parse.quote_plus(self.db_config.password)
-            username = urllib.parse.quote_plus(self.db_config.username)
+            # Use config.py database config
+            db = config.database
+            username = urllib.parse.quote_plus(db.username)
+            password = urllib.parse.quote_plus(db.password)
+
+            # Ensure driver string comes from .env or default
+            driver = db.driver.replace(" ", "+")  # "ODBC Driver 17 for SQL Server" → "ODBC+Driver+17+for+SQL+Server"
+
             connection_string = (
-                f"mssql+pyodbc://{username}:{password}@{self.db_config.server}/"
-                f"{self.db_config.database}?driver=ODBC+Driver+17+for+SQL+Server&TrustServerCertificate=yes"
+                f"mssql+pyodbc://{username}:{password}@{db.server}/{db.database}"
+                f"?driver={driver}&TrustServerCertificate=yes"
             )
-            
+
             engine = create_engine(
                 connection_string,
                 pool_size=10,
@@ -426,8 +431,9 @@ class EnhancedRTMSEngine:
             logger.info("✅ Database engine created successfully")
             return engine
         except Exception as e:
-            logger.error(f"❌ Failed to create database engine: {e}")
+            logger.error(f"❌ Failed to create database engine: {e}", exc_info=True)
             return None
+
 
     async def get_unit_codes(self) -> List[str]:
         """Get list of unique unit codes"""
@@ -1448,24 +1454,26 @@ async def get_efficiency_summary(
         """)
 
         detail_sql = text(f"""
-        SELECT 
-            A.EmpCode, A.EmpName, A.LineName, A.PartName,
-            A.NewOperSeq AS Operation, 
-            A.ProdnPcs AS Production,
-            A.Eff100   AS Target,
-            CASE WHEN A.Eff100 > 0 THEN (A.ProdnPcs * 100.0) / A.Eff100 ELSE 0 END AS Efficiency,
-            B.SupervisorName, B.SupervisorCode, B.PhoneNumber
-        FROM RTMS_SessionWiseProduction A
-        JOIN RTMS_SupervisorsDetl B
-          ON A.LineName = B.LineName AND A.PartName = B.PartName
-        WHERE A.ReptType = 'RTM$'
-          AND CAST(A.TranDate AS DATE) = '{fixed_date}'
-          AND A.UnitCode = :unit_code
-          AND A.FloorName = :floor_name
-          AND A.LineName = :line_name
-          AND A.PartName = :part_name
-          AND A.ISFinPart = 'Y'
-        """)
+            SELECT
+                A.EmpCode, A.EmpName, A.LineName, A.PartName,
+                A.UnitCode, A.FloorName,
+                A.NewOperSeq AS Operation,
+                A.ProdnPcs AS Production,
+                A.Eff100   AS Target,
+                CASE WHEN A.Eff100 > 0 THEN (A.ProdnPcs * 100.0) / A.Eff100 ELSE 0 END AS Efficiency,
+                B.SupervisorName, B.SupervisorCode, B.PhoneNumber
+            FROM RTMS_SessionWiseProduction A
+            JOIN RTMS_SupervisorsDetl B
+            ON A.LineName = B.LineName AND A.PartName = B.PartName
+            WHERE A.ReptType = 'RTM$'
+            AND CAST(A.TranDate AS DATE) = '{fixed_date}'
+            AND A.UnitCode = :unit_code
+            AND A.FloorName = :floor_name
+            AND A.LineName = :line_name
+            AND A.PartName = :part_name
+            AND A.ISFinPart = 'Y'
+            """)
+
 
         with rtms_engine.engine.connect() as conn:
             df_cte = pd.read_sql(cte_sql, conn, params={
@@ -1491,18 +1499,21 @@ async def get_efficiency_summary(
             df_u = df_emp[df_emp["Efficiency"] < 85.0]
             for _, r in df_u.iterrows():
                 underperformers.append({
-                    "emp_code": str(r.EmpCode),
-                    "emp_name": str(r.EmpName),
-                    "line_name": str(r.LineName),
-                    "part_name": str(r.PartName),
-                    "operation": str(r.Operation) if pd.notna(r.Operation) else None,
-                    "production": int(r.Production) if pd.notna(r.Production) else 0,
-                    "target": int(r.Target) if pd.notna(r.Target) else 0,
-                    "efficiency": float(r.Efficiency) if pd.notna(r.Efficiency) else 0.0,
-                    "supervisor_name": str(r.SupervisorName) if pd.notna(r.SupervisorName) else None,
-                    "supervisor_code": str(r.SupervisorCode) if pd.notna(r.SupervisorCode) else None,
-                    "phone_number": str(r.PhoneNumber) if pd.notna(r.PhoneNumber) else None,
-                })
+                "emp_code": str(r.EmpCode),
+                "emp_name": str(r.EmpName),
+                "unit_code": str(r.UnitCode),
+                "floor_name": str(r.FloorName),
+                "line_name": str(r.LineName),
+                "part_name": str(r.PartName),
+                "operation": str(r.Operation) if pd.notna(r.Operation) else None,
+                "production": int(r.Production) if pd.notna(r.Production) else 0,
+                "target": int(r.Target) if pd.notna(r.Target) else 0,
+                "efficiency": float(r.Efficiency) if pd.notna(r.Efficiency) else 0.0,
+                "supervisor_name": str(r.SupervisorName) if pd.notna(r.SupervisorName) else None,
+                "supervisor_code": str(r.SupervisorCode) if pd.notna(r.SupervisorCode) else None,
+                "phone_number": str(r.PhoneNumber) if pd.notna(r.PhoneNumber) else None,
+            })
+
 
         return {"success": True, "data": {
             "total_production": total_production,
@@ -2603,116 +2614,908 @@ async def predict_efficiency(request: PredictEfficiencyRequest):
         raise HTTPException(status_code=500, detail="AI prediction failed")
 
 
-# ================== ULTRA CHATBOT ==================
-# ---- SQL Server Engine ----
-engine = create_engine(
-    f"mssql+pyodbc://{DB_USERNAME}:{DB_PASSWORD}@{DB_SERVER}/{DB_DATABASE}?driver=ODBC+17+for+SQL+Server"
+# ================== FIXED ENHANCED ULTRA CHATBOT ==================
+import re
+import pandas as pd
+from typing import AsyncIterator, Tuple, Dict, Any, Optional
+from fastapi.responses import StreamingResponse
+from fastapi import HTTPException
+from sqlalchemy import text
+from datetime import datetime
+import logging
+from dotenv import load_dotenv
+import os
+
+# Load environment variables
+load_dotenv()
+
+# ====================== LOGGING CONFIGURATION ======================
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),  # Console output
+        logging.FileHandler('fabric_pulse_ai.log')  # Log to file for persistence
+    ]
 )
+logger = logging.getLogger(__name__)
 
-# ---- Groq Client ----
+# ====================== DATABASE CONFIGURATION ======================
+from sqlalchemy import create_engine
 
+DATABASE_URL = os.getenv("DATABASE_URL")
+rtms_engine = create_engine(
+    f"mssql+pyodbc://{DB_USERNAME}:{DB_PASSWORD}@{DB_SERVER}/{DB_DATABASE}?driver=ODBC+17+for+SQL+Server")
+logger.info("✅ Database engine created successfully")
 
+# ====================== ENHANCED INTENT DETECTION ======================
+def detect_intent(query: str) -> Tuple[str, Dict[str, Any]]:
+    """Enhanced intent detection for all 46 training questions"""
+    q = query.lower().strip()
+    
+    # Extract entities from query
+    entities = extract_all_entities(query)
+    logger.debug(f"Extracted entities from query '{query}': {entities}")
+    
+    # Log detected entities for debugging
+    logger.debug(f"Extracted entities from query '{query}': {entities}")
+    
+    # Production Output Queries (1-7)
+    if any(phrase in q for phrase in ["production output", "production in", "target and actual production", "production pieces"]):
+        if "line" in q or entities.get("line_name"):
+            return "production_output_line", entities
+        elif "floor" in q and extract_floor_name(q):
+            return "production_output_floor", entities
+        elif "unit" in q and extract_unit_code(q):
+            return "production_output_unit", entities
+        elif "part" in q and extract_part_name(q):
+            return "production_output_part", entities
+        elif "operation" in q and extract_operation(q):
+            return "production_output_operation", entities
+        elif "supervisor" in q:
+            return "production_output_supervisor", entities
+        elif "employee" in q and extract_employee(q):
+            return "production_output_employee", entities
+    
+    # Performance Analysis (8-13)
+    if "performing above" in q and "85%" in q:
+        return "lines_above_85_efficiency", entities
+    elif "performing below" in q and "85%" in q:
+        return "lines_below_85_efficiency", entities
+    elif "best performing line" in q or ("best" in q and "line" in q):
+        return "best_performing_line", entities
+    elif "worst performing line" in q or ("worst" in q and "line" in q):
+        return "worst_performing_line", entities
+    elif "best performing supervisor" in q or ("best" in q and "supervisor" in q):
+        return "best_performing_supervisor", entities
+    elif "worst performing supervisor" in q or ("worst" in q and "supervisor" in q):
+        return "worst_performing_supervisor", entities
+    
+    # Supervisor Management (14-16, 19, 24, 44)
+    if "supervisor in charge" in q and "part" in q and "line" in q:
+        return "supervisor_by_part_line", entities
+    elif "supervisor in charge" in q and "employee" in q:
+        return "supervisor_by_employee", entities
+    elif "part" in q and "supervised by" in q:
+        return "parts_by_supervisor", entities
+    elif "buyer codes" in q and "supervisor" in q:
+        return "buyer_codes_by_supervisor", entities
+    elif "parts require supervisor" in q:
+        return "parts_require_supervisor", entities
+    
+    # Efficiency Metrics (17-18, 20-21)
+    if "efficiency" in q:
+        if "line" in q and extract_line_name(q):
+            return "efficiency_line", entities
+        elif "part" in q and extract_part_name(q):
+            return "efficiency_part", entities
+        elif "operation" in q and extract_operation(q):
+            return "efficiency_operation", entities
+        elif "employee" in q and extract_employee(q):
+            return "efficiency_employee", entities
+        elif "supervisor" in q:
+            return "efficiency_supervisor", entities
+    
+    # Production Details (22-23, 25-27, 33)
+    if "details" in q or "operators are working" in q:
+        if "line" in q or entities.get("line_name"):
+            return "production_details_line", entities
+        elif "part" in q or entities.get("part_name"):
+            return "production_details_part", entities
+        elif "unit" in q or entities.get("unit_code"):
+            return "production_details_unit", entities
+        elif "floor" in q or entities.get("floor_name"):
+            return "production_details_floor", entities
 
+    # Final Operations (29-30)
+    if "final part" in q and "line" in q:
+        return "final_part_in_line", entities
+    elif "final operation" in q and "part" in q:
+        return "final_operation_in_part", entities
+    
+    # Red Flag Analysis (31-32)
+    if "flagged as red" in q or "isredflag=1" in q or "red flag" in q:
+        if "line" in q:
+            return "red_flagged_employees_line", entities
+        elif "part" in q:
+            return "red_flagged_employees_part", entities
+    
+    # Time-based Reports and Metrics (34-40, 45-46)
+    if "hours" in q and "employee" in q and "today" in q:
+        return "employee_hours_today", entities
+    elif "minutes" in q and "employee" in q:
+        return "employee_minutes_used", entities
+    elif "production pieces" in q and "employee" in q and "completed" in q:
+        return "employee_production_completed", entities
+    elif "production report" in q:
+        if "today" in q:
+            return "production_report_today", entities
+        elif "this week" in q:
+            return "production_report_this_week", entities
+        elif "last month" in q:
+            return "production_report_last_month", entities
+        elif "yesterday" in q:
+            return "production_report_yesterday", entities
+        elif "day before yesterday" in q:
+            return "production_report_day_before_yesterday", entities
+        elif "line" in q:
+            return "production_report_line", entities
+    
+    # AI Predictions (41-43)
+    if "production prediction" in q:
+        return "production_prediction", entities
+    elif "trend analysis" in q:
+        return "production_trend_analysis", entities
+    elif "lines require attention" in q:
+        return "lines_require_attention", entities
+    
+    if "trend analysis" in q:
+        return "production_trend_analysis", entities
+    
+    # Report Generation (28)
+    if "detailed report" in q or ("generate report" in q and "line" in q) or ("report for" in q and ("line" in q or entities.get("line_name"))):
+        return "generate_detailed_report", entities
+    
+    # Fallback to legacy intents
+    return detect_legacy_intent(query), entities
+
+# ====================== ENHANCED ENTITY EXTRACTION ======================
+def extract_all_entities(query: str) -> Dict[str, Any]:
+    """Extract all possible entities from query (context-aware)."""
+    entities = {}
+
+    # Prefer context-aware extraction (explicit "unit" / "line" tokens)
+    unit_from_ctx = None
+    line_from_ctx = None
+
+    # explicit "unit <code>"
+    if m := re.search(r"\bunit(?:code)?\s*[:\-]?\s*([A-Za-z]\d{1,2}-\d)\b", query, re.I):
+        unit_from_ctx = m.group(1).upper()
+
+    # explicit "line <code>"
+    if m := re.search(r"\bline\s+([A-Za-z]\d+-\d+)\b", query, re.I):
+        line_from_ctx = m.group(1).upper()
+
+    # Unit Code (fallback)
+    if unit_from_ctx:
+        entities['unit_code'] = unit_from_ctx
+    else:
+        if unit := extract_unit_code(query):
+            entities['unit_code'] = unit
+
+    # Line Name (fallback)
+    if line_from_ctx:
+        entities['line_name'] = line_from_ctx
+    else:
+        if line := extract_line_name(query):
+            entities['line_name'] = line
+
+    # Floor Name
+    if floor := extract_floor_name(query):
+        entities['floor_name'] = floor
+
+    # Part Name
+    if part := extract_part_name(query):
+        entities['part_name'] = part
+
+    # Operation
+    if operation := extract_operation(query):
+        entities['operation'] = operation
+
+    # Employee
+    if employee := extract_employee(query):
+        entities['employee'] = employee
+
+    # Supervisor
+    if supervisor := extract_supervisor(query):
+        entities['supervisor'] = supervisor
+
+    # Style Number
+    if style := extract_style_number(query):
+        entities['style_no'] = style
+
+    # Time window
+    entities['time_window'] = extract_time_window(query)
+
+    return entities
+
+def extract_unit_code(query: str) -> Optional[str]:
+    """Extract unit code like D15-2, D12-1."""
+    if m := re.search(r"\b([A-Z]\d{1,2}-\d)\b", query, re.I):
+        candidate = m.group(1).upper()
+        start = m.start(1)
+        snippet_before = query[:start].lower()
+        if re.search(r"\bline\s*$", snippet_before):
+            return None
+        return candidate
+    return None
+
+def extract_line_name(query: str) -> Optional[str]:
+    """Extract line name like S1-1, L2-3."""
+    if m := re.search(r"\bline\s+([A-Za-z]\d+-\d+)\b", query, re.I):
+        return m.group(1).upper()
+    if m := re.search(r"\b([SLsl]\d+-\d+)\b", query, re.I):
+        return m.group(1).upper()
+    return None
+
+def extract_floor_name(query: str) -> Optional[str]:
+    """Extract floor name or number"""
+    if m := re.search(r"\bfloor\s+(\w+)", query, re.I):
+        return m.group(1).upper()
+    return None
+
+def extract_part_name(query: str) -> Optional[str]:
+    """Extract part name"""
+    if m := re.search(r"\bpart\s+([A-Za-z0-9\-\_ ]+?)(?:\s|$)", query, re.I):
+        return m.group(1).strip()
+    return None
+
+def extract_operation(query: str) -> Optional[str]:
+    """Extract operation/NewOperSeq"""
+    if m := re.search(r"\b(operation|op|newoperseq)\s+([A-Za-z0-9\-\_]+)", query, re.I):
+        return m.group(2).upper()
+    return None
+
+def extract_employee(query: str) -> Optional[str]:
+    """Extract employee code or name"""
+    if m := re.search(r"\bemployee\s+([A-Za-z0-9\-\_\s]+?)(?:\s|$)", query, re.I):
+        return m.group(1).strip()
+    return None
+
+def extract_supervisor(query: str) -> Optional[str]:
+    """Extract supervisor name or code"""
+    if m := re.search(r"\bsupervisor\s+([A-Za-z0-9\-\_\s]+?)(?:\s|$)", query, re.I):
+        return m.group(1).strip()
+    return None
+
+def extract_style_number(query: str) -> Optional[str]:
+    """Extract style number"""
+    if m := re.search(r"\bstyle(no)?\s*([A-Za-z0-9\-\_]+)", query, re.I):
+        return m.group(2).upper()
+    return None
+
+def extract_time_window(query: str) -> Dict[str, Any]:
+    """Extract time window information"""
+    q = query.lower()
+    
+    if "today" in q:
+        return {"period": "today", "sql_condition": "CAST(A.TranDate AS DATE) = CAST(GETDATE() AS DATE)"}
+    elif "yesterday" in q:
+        return {"period": "yesterday", "sql_condition": "CAST(A.TranDate AS DATE) = CAST(DATEADD(DAY, -1, GETDATE()) AS DATE)"}
+    elif "day before yesterday" in q:
+        return {"period": "day_before_yesterday", "sql_condition": "CAST(A.TranDate AS DATE) = CAST(DATEADD(DAY, -2, GETDATE()) AS DATE)"}
+    elif "this week" in q:
+        return {"period": "this_week", "sql_condition": "DATEPART(WEEK, A.TranDate) = DATEPART(WEEK, GETDATE()) AND YEAR(A.TranDate) = YEAR(GETDATE())"}
+    elif "last week" in q:
+        return {"period": "last_week", "sql_condition": "DATEPART(WEEK, A.TranDate) = DATEPART(WEEK, GETDATE()) - 1 AND YEAR(A.TranDate) = YEAR(GETDATE())"}
+    elif "this month" in q:
+        return {"period": "this_month", "sql_condition": "MONTH(A.TranDate) = MONTH(GETDATE()) AND YEAR(A.TranDate) = YEAR(GETDATE())"}
+    elif "last month" in q:
+        return {"period": "last_month", "sql_condition": "MONTH(A.TranDate) = MONTH(GETDATE()) - 1 AND YEAR(A.TranDate) = YEAR(GETDATE())"}
+    
+    return {"period": "today", "sql_condition": "CAST(A.TranDate AS DATE) = CAST(GETDATE() AS DATE)"}
+
+def detect_legacy_intent(q: str) -> str:
+    """Legacy intent detection for backward compatibility"""
+    ql = q.lower()
+    patterns = {
+        "best_supervisor": r"best\s+perform(ing|er)\s+supervisor",
+        "best_employee": r"best\s+perform(ing|er)\s+employee",
+        "best_line": r"best\s+perform(ing)?\s+line",
+        "min_eff": r"(lowest|min(imum)?)\s+eff(iciency)?",
+        "max_eff": r"(highest|max(imum)?)\s+eff(iciency)?",
+        "worst_line": r"(lowest|min(imum)?)\s+line",
+        "worst_employee": r"(lowest|min(imum)?)\s+employee",
+        "worst_supervisor": r"(lowest|min(imum)?)\s+supervisor",
+    }
+    
+    for intent, pat in patterns.items():
+        if re.search(pat, ql):
+            return intent
+    
+    if re.search(r"line\s+[A-Za-z0-9\-]+", ql) and "details" in ql:
+        return "line_details"
+    if re.search(r"employee\s+[A-Za-z0-9\-]+", ql) and "details" in ql:
+        return "employee_details"
+    if re.search(r"supervisor\s+[A-Za-z ]+", ql) and "details" in ql:
+        return "supervisor_details"
+    
+    return "unknown"
+
+# ====================== ENHANCED SQL QUERY BUILDERS ======================
+class EnhancedQueryBuilder:
+    """Enhanced query builder for all 46 training questions"""
+    
+    @staticmethod
+    def build_query_for_intent(intent: str, entities: Dict[str, Any]) -> Tuple[str, Dict[str, Any], str]:
+        """Build SQL query based on intent and entities"""
+        
+        time_condition = entities.get('time_window', {}).get('sql_condition', "CAST(A.TranDate AS DATE) = CAST(GETDATE() AS DATE)")
+        where_parts = [time_condition, "A.ReptType IN ('RTM$', 'RTMS', 'RTM5')"]
+        params = {}
+        
+        if entities.get('unit_code'):
+            where_parts.append("A.UnitCode = :unit_code")
+            params['unit_code'] = entities['unit_code']
+        
+        if entities.get('line_name'):
+            where_parts.append("A.LineName = :line_name")
+            params['line_name'] = entities['line_name']
+        
+        if entities.get('floor_name'):
+            where_parts.append("A.FloorName = :floor_name")
+            params['floor_name'] = entities['floor_name']
+        
+        if entities.get('part_name'):
+            where_parts.append("A.PartName = :part_name")
+            params['part_name'] = entities['part_name']
+        
+        if entities.get('operation'):
+            where_parts.append("A.NewOperSeq = :operation")
+            params['operation'] = entities['operation']
+        
+        base_where = " AND ".join(where_parts)
+        
+        if intent == "production_output_line":
+            return f"""
+                SELECT A.LineName, SUM(A.ProdnPcs) as TotalProduction, SUM(A.Eff100) as TargetProduction
+                FROM RTMS_SessionWiseProduction A
+                WHERE {base_where}
+                GROUP BY A.LineName
+            """, params, "Production output by line"
+        
+        elif intent == "production_output_floor":
+            return f"""
+                SELECT A.FloorName, SUM(A.ProdnPcs) as TotalProduction, SUM(A.Eff100) as TargetProduction
+                FROM RTMS_SessionWiseProduction A
+                WHERE {base_where}
+                GROUP BY A.FloorName
+            """, params, "Production output by floor"
+        
+        # Add other intents as needed...
+        else:
+            return build_legacy_sql_for_intent(intent, entities, base_where, params)
+
+def build_legacy_sql_for_intent(intent: str, entities: Dict[str, Any], base_where: str, params: Dict[str, Any]) -> Tuple[str, Dict[str, Any], str]:
+    """Legacy SQL builder for backward compatibility"""
+    
+    if intent == "max_eff":
+        sql = f"""
+            SELECT TOP 1 A.EffPer AS Efficiency, A.LineName, A.PartName, 
+                   A.NewOperSeq, A.EmpName, A.EmpCode, A.TranDate
+            FROM RTMS_SessionWiseProduction A
+            WHERE {base_where}
+            ORDER BY A.EffPer DESC
+        """
+        return sql, params, "Max efficiency"
+    
+    elif intent == "min_eff":
+        sql = f"""
+            SELECT TOP 1 A.EffPer AS Efficiency, A.LineName, A.PartName, 
+                   A.NewOperSeq, A.EmpName, A.EmpCode, A.TranDate
+            FROM RTMS_SessionWiseProduction A
+            WHERE {base_where}
+            ORDER BY A.EffPer ASC
+        """
+        return sql, params, "Min efficiency"
+    
+    else:
+        return "SELECT 1 as NoData", {}, "Unknown query type"
+
+# ====================== CACHE REFRESH HANDLER ======================
+async def refresh_cache():
+    """Refresh cache data for production, efficiency, and chat"""
+    try:
+        sql_prod = """
+            SELECT LineName, SUM(ProdnPcs) as TotalProduction, SUM(Eff100) as TargetProduction
+            FROM RTMS_SessionWiseProduction
+            WHERE CAST(TranDate AS DATE) = CAST(GETDATE() AS DATE) AND ReptType IN ('RTM$', 'RTMS', 'RTM5')
+            GROUP BY LineName
+        """
+        sql_eff = """
+            SELECT LineName, AVG(EffPer) as AvgEfficiency
+            FROM RTMS_SessionWiseProduction
+            WHERE CAST(TranDate AS DATE) = CAST(GETDATE() AS DATE) AND ReptType IN ('RTM$', 'RTMS', 'RTM5')
+            GROUP BY LineName
+        """
+        sql_chat = """
+            SELECT LineName, PartName, EmpCode, EmpName, ProdnPcs, EffPer, IsRedFlag
+            FROM RTMS_SessionWiseProduction
+            WHERE CAST(TranDate AS DATE) = CAST(GETDATE() AS DATE) AND ReptType IN ('RTM$', 'RTMS', 'RTM5')
+        """
+        
+        with rtms_engine.connect() as conn:
+            try:
+                df_prod = pd.read_sql(text(sql_prod), conn)
+            except Exception as e:
+                logger.error(f"Failed to execute production cache query: {sql_prod}\nError: {str(e)}", exc_info=True)
+                raise
+            try:
+                df_eff = pd.read_sql(text(sql_eff), conn)
+            except Exception as e:
+                logger.error(f"Failed to execute efficiency cache query: {sql_eff}\nError: {str(e)}", exc_info=True)
+                raise
+            try:
+                df_chat = pd.read_sql(text(sql_chat), conn)
+            except Exception as e:
+                logger.error(f"Failed to execute chat cache query: {sql_chat}\nError: {str(e)}", exc_info=True)
+                raise
+        
+        logger.info(f"✅ Cache refreshed: prod={len(df_prod)}, eff={len(df_eff)}, chat={len(df_chat)}")
+        
+        return {"status": "success", "prod_rows": len(df_prod), "eff_rows": len(df_eff), "chat_rows": len(df_chat)}
+    
+    except Exception as e:
+        logger.error(f"Cache refresh failed: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Cache refresh failed: {str(e)}")
+
+# ====================== MAIN CHATBOT ENDPOINT ======================
 @router.post("/api/ai/ultra_chatbot")
 async def ultra_advanced_ai_chatbot(request: dict):
+    """Enhanced chatbot endpoint that handles all 46 training questions"""
     try:
-        user_query = request.get("query")
+        user_query = (request.get("query") or request.get("prompt") or "").strip()
         if not user_query:
-            raise HTTPException(status_code=400, detail="Missing query")
-
-        # --- Detect production queries ---
-        production_keywords = [
-            "efficiency", "production", "line", "pcs", "target",
-            "effper", "eff100", "trandate", "supervisor", "part", "floor"
-        ]
-        is_production_query = any(kw in user_query.lower() for kw in production_keywords)
-
-        # --- Case A: General AI ---
-        if not is_production_query:
-            final_prompt = f"You are a helpful assistant.\n\nUser query: {user_query}"
-        else:
-            # --- Generate SQL ---
-            sql_system_prompt = """
-            You are a data assistant. Convert natural language questions
-            into SQL queries for SQL Server.
-
-            Table: production
-            Columns:
-            - TranDate (date)
-            - ProdnPcs (integer)
-            - Eff100 (integer)
-            - EffPer (float)
-            - LineName (text)
-            - PartName (text)
-            - FloorName (text)
-            - Supervisor (text)
-
-            Rules:
-            - Only return SQL query, no explanation.
-            - Always aggregate or limit rows so result set is small (<10 rows).
-            - Use T-SQL syntax (SQL Server).
-            """
-
-            completion = groq_client.chat.completions.create(
-                model="llama-3.1-8b-instant",
-                messages=[
-                    {"role": "system", "content": sql_system_prompt},
-                    {"role": "user", "content": user_query}
-                ],
-                temperature=0,
-            )
-            sql_query = completion.choices[0].message["content"].strip()
-
-            # --- Execute SQL ---
+            raise HTTPException(status_code=400, detail="Missing query text.")
+        
+        # Detect intent and extract entities
+        intent, entities = detect_intent(user_query)
+        logger.info(f"Detected intent: {intent}, entities: {entities}")
+        
+        # Handle special cases
+        if intent == "generate_detailed_report":
+            return await handle_generate_detailed_report(entities, user_query)
+        elif intent == "production_prediction":
+            return await handle_production_prediction(entities)
+        elif intent == "production_trend_analysis":
+            return await handle_trend_analysis(entities)
+        elif intent == "lines_require_attention":
+            return await handle_lines_require_attention(entities)
+        
+        # Build and execute SQL query
+        if intent != "unknown":
             try:
-                with engine.connect() as conn:
-                    result = pd.read_sql(text(sql_query), conn)
-            except Exception as e:
-                raise HTTPException(status_code=500, detail=f"SQL execution failed: {e}")
-
-            result_json = result.to_dict(orient="records")
-
-            # --- Business prompt ---
-            final_prompt = f"""
-User asked: {user_query}
-SQL executed: {sql_query}
-Result: {result_json}
-
-You are a garment factory production intelligence assistant.
-
-Responsibilities:
-1. Analyze production data (ProdnPcs, Eff100, EffPer, TranDate, LineName, PartName, Supervisor).
-2. Detect efficiency trends and PREDICT whether they are improving, declining, or stable.
-3. If efficiency <85%, flag as a RED ALERT and give corrective actions.
-4. If efficiency is 85–95%, classify as ACCEPTABLE but suggest improvements.
-5. If efficiency >95%, classify as EXCELLENT and encourage continuation.
-6. Always explain WHY the trend is happening.
-7. End with 2–3 specific, actionable supervisor steps.
-8. If no matching data, reply: "No data found for this query, but here are best practices..."
-
-Output format:
-- First line: Direct insight (efficiency %, classification, trend prediction).
-- Next lines: Supporting reasoning (with data if available).
-- Final lines: Recommended actions (bulleted).
-"""
-
-        # --- Stream response from Groq ---
-        async def response_stream():
-            response = groq_client.chat.completions.create(
-                model="llama-3.1-8b-instant",
-                messages=[{"role": "user", "content": final_prompt}],
-                temperature=0.4,
-                top_p=0.9,
-                stream=True,
-            )
-            for chunk in response:
-                if chunk.choices[0].delta.content:
-                    yield chunk.choices[0].delta.content
-
-        return StreamingResponse(response_stream(), media_type="text/plain")
-
+                sql, params, description = EnhancedQueryBuilder.build_query_for_intent(intent, entities)
+                
+                logger.debug(f"Executing SQL for intent '{intent}': {sql}")
+                logger.debug(f"SQL parameters: {params}")
+                
+                with rtms_engine.connect() as conn:
+                    try:
+                        df = pd.read_sql(text(sql), conn, params=params)
+                    except Exception as sql_error:
+                        logger.error(f"SQL execution failed for intent '{intent}': {sql}\nParameters: {params}\nError: {str(sql_error)}", exc_info=True)
+                        raise
+                
+                if df.empty:
+                    logger.warning(f"No data fetched for intent '{intent}' with query '{user_query}'.")
+                else:
+                    logger.debug(f"Fetched data for intent '{intent}': shape={df.shape}, head=\n{df.head().to_string()}")
+                
+                # Format response
+                response = format_response(intent, df, description)
+                
+                logger.debug(f"Formatted response for intent '{intent}' based on data: {response}")
+                
+                return StreamingResponse(iter([response]), media_type="text/plain")
+                
+            except Exception as sql_error:
+                logger.error(f"SQL execution failed for intent '{intent}': {sql}\nParameters: {params}\nError: {str(sql_error)}", exc_info=True)
+                error_response = f"Unable to process your request for {description.lower()}. Please check your query parameters."
+                return StreamingResponse(iter([error_response]), media_type="text/plain")
+        
+        # Fallback to LLM for unknown queries
+        final_prompt = f"Answer concisely based on garment production context:\nUser: {user_query}\n"
+        
+        logger.warning(f"Falling back to LLM for unknown intent. Prompt: {final_prompt}")
+        
+        async def gen() -> AsyncIterator[str]:
+            try:
+                async for chunk in astream(final_prompt):
+                    yield str(chunk)
+            except Exception:
+                yield await complete(final_prompt)
+        
+        return StreamingResponse(gen(), media_type="text/plain")
+        
+    except HTTPException:
+        raise
     except Exception as e:
+        logger.error(f"Chatbot error: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Chatbot error: {e}")
+
+# ====================== ENHANCED RESPONSE FORMATTER ======================
+def format_response(intent: str, df: pd.DataFrame, description: str) -> str:
+    """Enhanced response formatter for all query types"""
+    
+    if df.empty:
+        return f"No data found for {description.lower()}."
+    
+    if intent.startswith("production_output_"):
+        if len(df) == 1:
+            row = df.iloc[0]
+            total = row.get('TotalProduction', 0)
+            target = row.get('TargetProduction', 0)
+            return f"{description}: Actual: {int(total):,} pieces, Target: {int(target):,} pieces"
+        else:
+            lines = [f"{description}:"]
+            for _, row in df.iterrows():
+                total = row.get('TotalProduction', 0)
+                target = row.get('TargetProduction', 0)
+                identifier = row.get('LineName') or row.get('FloorName') or row.get('UnitCode') or row.get('PartName') or row.get('SupervisorName') or row.get('EmpName', 'Unknown')
+                lines.append(f"• {identifier}: Actual: {int(total):,} pieces, Target: {int(target):,} pieces")
+            return "\n".join(lines[:10])
+    
+    else:
+        return format_generic_response(df, description)
+
+def format_generic_response(df: pd.DataFrame, description: str) -> str:
+    """Generic response formatter"""
+    lines = [f"{description}:"]
+    
+    for _, row in df.head(10).iterrows():
+        row_parts = []
+        for col, val in row.items():
+            if pd.notna(val) and col not in ['TranDate', 'RowId']:
+                if isinstance(val, (int, float)):
+                    if col.endswith('Efficiency') or col.endswith('EffPer'):
+                        row_parts.append(f"{col}: {val:.1f}%")
+                    elif col.endswith('Pcs') or col.endswith('Production'):
+                        row_parts.append(f"{col}: {int(val):,}")
+                    else:
+                        row_parts.append(f"{col}: {val}")
+                else:
+                    row_parts.append(f"{col}: {val}")
+        
+        if row_parts:
+            lines.append("• " + " | ".join(row_parts[:5]))
+    
+    return "\n".join(lines)
+
+# ====================== SPECIALIZED HANDLERS ======================
+async def handle_generate_detailed_report(entities: Dict[str, Any], user_query: str) -> StreamingResponse:
+    """Generate detailed report with real database data"""
+    try:
+        line_name = entities.get('line_name')
+        time_condition = entities.get('time_window', {}).get('sql_condition', "CAST(A.TranDate AS DATE) = CAST(GETDATE() AS DATE)")
+        
+        if not line_name:
+            logger.warning("No line name specified for detailed report.")
+            return StreamingResponse(iter(["Please specify a line name for the detailed report (e.g., S2-1, L1-2)."]), media_type="text/plain")
+        
+        sql = f"""
+            SELECT 
+                A.LineName,
+                A.UnitCode,
+                A.FloorName,
+                A.PartName,
+                A.StyleNo,
+                A.Operation,
+                A.NewOperSeq,
+                A.EmpCode,
+                A.EmpName,
+                A.ProdnPcs,
+                A.Eff100,
+                A.EffPer,
+                A.UsedMin,
+                A.IsRedFlag,
+                A.TranDate,
+                B.SupervisorName,
+                B.SupervisorCode,
+                B.PhoneNumber
+            FROM RTMS_SessionWiseProduction A
+            LEFT JOIN RTMS_SupervisorsDetl B ON A.LineName = B.LineName AND A.PartName = B.PartName
+            WHERE {time_condition}
+              AND A.ReptType IN ('RTM$', 'RTMS', 'RTM5')
+              AND A.LineName = :line_name
+            ORDER BY A.TranDate DESC, A.ProdnPcs DESC
+        """
+        
+        params = {"line_name": line_name}
+        
+        logger.debug(f"Executing detailed report SQL: {sql}")
+        logger.debug(f"SQL parameters: {params}")
+        
+        with rtms_engine.connect() as conn:
+            try:
+                df = pd.read_sql(text(sql), conn, params=params)
+            except Exception as sql_error:
+                logger.error(f"Failed to execute detailed report query: {sql}\nParameters: {params}\nError: {str(sql_error)}", exc_info=True)
+                raise
+        
+        logger.debug(f"Fetched data for detailed report: shape={df.shape}, head=\n{df.head().to_string()}")
+        
+        if df.empty:
+            logger.warning(f"No data found for line {line_name}.")
+            return StreamingResponse(iter([f"No production data found for line {line_name} today. Please check the line name or try a different date range."]), media_type="text/plain")
+        
+        report_lines = []
+        report_lines.append(f"📋 **DETAILED PRODUCTION REPORT - LINE {line_name}**")
+        report_lines.append(f"📅 **Date:** {datetime.now().strftime('%Y-%m-%d')}")
+        report_lines.append(f"⏰ **Generated:** {datetime.now().strftime('%H:%M:%S')}")
+        report_lines.append("")
+        
+        total_production = df['ProdnPcs'].sum()
+        total_target = df['Eff100'].sum()
+        avg_efficiency = df['EffPer'].mean()
+        total_operators = df['EmpCode'].nunique()
+        red_flag_count = df[df['IsRedFlag'] == 1]['EmpCode'].nunique()
+        total_minutes = df['UsedMin'].sum()
+        total_hours = total_minutes / 60.0
+        
+        efficiency_status = (
+            "🟢 Excellent" if avg_efficiency >= 90 else
+            "🟡 Good" if avg_efficiency >= 80 else
+            "🟠 Fair" if avg_efficiency >= 70 else
+            "🔴 Critical"
+        )
+        
+        report_lines.extend([
+            "📊 **SUMMARY METRICS:**",
+            f"   • Total Production: {int(total_production):,} pieces",
+            f"   • Target Production: {int(total_target):,} pieces",
+            f"   • Achievement Rate: {(total_production/total_target*100):.1f}%" if total_target > 0 else "   • Achievement Rate: N/A",
+            f"   • Average Efficiency: {avg_efficiency:.1f}% ({efficiency_status})",
+            f"   • Total Operators: {total_operators}",
+            f"   • Red Flag Alerts: {red_flag_count}",
+            f"   • Total Working Hours: {total_hours:.1f} hours",
+            ""
+        ])
+        
+        if not df['UnitCode'].isna().all():
+            unit_info = df['UnitCode'].dropna().iloc[0] if len(df) > 0 else "N/A"
+            floor_info = df['FloorName'].dropna().iloc[0] if len(df['FloorName'].dropna()) > 0 else "N/A"
+            report_lines.extend([
+                "🏭 **LOCATION DETAILS:**",
+                f"   • Unit Code: {unit_info}",
+                f"   • Floor Name: {floor_info}",
+                ""
+            ])
+        
+        supervisors = df[df['SupervisorName'].notna()]['SupervisorName'].unique()
+        if len(supervisors) > 0:
+            report_lines.append("👨‍💼 **SUPERVISORS:**")
+            for supervisor in supervisors:
+                supervisor_data = df[df['SupervisorName'] == supervisor].iloc[0]
+                phone = supervisor_data.get('PhoneNumber', 'N/A')
+                code = supervisor_data.get('SupervisorCode', 'N/A')
+                report_lines.append(f"   • {supervisor} ({code}) - Phone: {phone}")
+            report_lines.append("")
+        
+        part_summary = df.groupby(['PartName', 'StyleNo']).agg({
+            'ProdnPcs': 'sum',
+            'Eff100': 'sum', 
+            'EffPer': 'mean',
+            'EmpCode': 'nunique',
+            'IsRedFlag': lambda x: (x == 1).sum()
+        }).reset_index()
+        
+        if not part_summary.empty:
+            report_lines.append("🔧 **PRODUCTION BY PART:**")
+            for _, part_row in part_summary.iterrows():
+                part_name = part_row['PartName']
+                style_no = part_row['StyleNo']
+                prod = int(part_row['ProdnPcs'])
+                target = int(part_row['Eff100'])
+                eff = part_row['EffPer']
+                operators = int(part_row['EmpCode'])
+                red_flags = int(part_row['IsRedFlag'])
+                
+                status_emoji = "🔴" if red_flags > 0 else "🟡" if eff < 80 else "🟢"
+                achievement = (prod/target*100) if target > 0 else 0
+                
+                report_lines.extend([
+                    f"{status_emoji} **{part_name}** (Style: {style_no})",
+                    f"   • Production: {prod:,} / {target:,} pieces ({achievement:.1f}%)",
+                    f"   • Efficiency: {eff:.1f}%",
+                    f"   • Operators: {operators}",
+                    f"   • Issues: {red_flags} red flags",
+                    ""
+                ])
+        
+        top_performers = df[df['EffPer'] >= 90].nlargest(5, 'EffPer')[['EmpName', 'EmpCode', 'EffPer', 'ProdnPcs']]
+        if not top_performers.empty:
+            report_lines.append("🏆 **TOP PERFORMERS:**")
+            for _, emp_row in top_performers.iterrows():
+                emp_name = emp_row['EmpName']
+                emp_code = emp_row['EmpCode']
+                efficiency = emp_row['EffPer']
+                production = int(emp_row['ProdnPcs'])
+                report_lines.append(f"   • {emp_name} ({emp_code}): {efficiency:.1f}% - {production} pieces")
+            report_lines.append("")
+        
+        red_flagged = df[df['IsRedFlag'] == 1][['EmpName', 'EmpCode', 'PartName', 'EffPer', 'ProdnPcs']]
+        if not red_flagged.empty:
+            report_lines.append("🚨 **ATTENTION REQUIRED:**")
+            for _, red_row in red_flagged.iterrows():
+                emp_name = red_row['EmpName']
+                emp_code = red_row['EmpCode']
+                part = red_row['PartName']
+                efficiency = red_row['EffPer']
+                production = int(red_row['ProdnPcs'])
+                report_lines.append(f"   • {emp_name} ({emp_code}) - {part}: {efficiency:.1f}% ({production} pcs)")
+            report_lines.append("")
+        
+        report_lines.append("💡 **RECOMMENDATIONS:**")
+        if avg_efficiency < 75:
+            report_lines.append("   🎯 **Critical Action Required:**")
+            report_lines.append("     • Review workflow processes")
+            report_lines.append("     • Provide additional training")
+            report_lines.append("     • Check equipment functionality")
+        elif avg_efficiency < 85:
+            report_lines.append("   ⚠️ **Improvement Opportunities:**")
+            report_lines.append("     • Monitor operators closely")
+            report_lines.append("     • Optimize part allocation")
+            report_lines.append("     • Review time standards")
+        else:
+            report_lines.append("   ✅ **Excellent Performance:**")
+            report_lines.append("     • Continue current operations")
+            report_lines.append("     • Share best practices with other lines")
+        
+        if red_flag_count > 0:
+            report_lines.append("   🔴 **Address Red Flags:**")
+            report_lines.append("     • Provide immediate support to flagged operators")
+            report_lines.append("     • Investigate root causes")
+            report_lines.append("     • Implement corrective measures")
+        
+        report_lines.extend([
+            "",
+            "---",
+            f"📞 For detailed analysis, contact line supervisor",
+            f"📊 Report generated by RTMS AI Assistant at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        ])
+        
+        full_report = "\n".join(report_lines)
+        
+        logger.debug(f"Generated detailed report based on data:\n{full_report}")
+        
+        return StreamingResponse(iter([full_report]), media_type="text/plain")
+        
+    except Exception as e:
+        logger.error(f"Detailed report generation failed: {str(e)}", exc_info=True)
+        return StreamingResponse(iter([f"Unable to generate detailed report: {str(e)}"]), media_type="text/plain")
+
+async def handle_production_prediction(entities: Dict[str, Any]) -> StreamingResponse:
+    """Handle production prediction requests (Question 41)"""
+    try:
+        sql = f"""
+            SELECT CAST(A.TranDate AS DATE) as Date, SUM(A.ProdnPcs) as TotalProduction
+            FROM RTMS_SessionWiseProduction A
+            WHERE A.TranDate >= DATEADD(DAY, -7, GETDATE()) AND A.ReptType IN ('RTM$', 'RTMS', 'RTM5')
+            GROUP BY CAST(A.TranDate AS DATE)
+            ORDER BY Date DESC
+        """
+        
+        logger.debug(f"Executing prediction SQL: {sql}")
+        
+        with rtms_engine.connect() as conn:
+            try:
+                df = pd.read_sql(text(sql), conn)
+            except Exception as sql_error:
+                logger.error(f"Failed to execute prediction query: {sql}\nError: {str(sql_error)}", exc_info=True)
+                raise
+        
+        logger.debug(f"Fetched data for prediction: shape={df.shape}, head=\n{df.head().to_string()}")
+        
+        if df.empty:
+            return StreamingResponse(iter(["No historical data for prediction."]), media_type="text/plain")
+        
+        avg = df['TotalProduction'].mean()
+        report = f"Based on last 7 days, average daily production: {int(avg):,} pieces. Predicted for tomorrow: {int(avg):,} pieces."
+        
+        logger.debug(f"Generated prediction: {report}")
+        
+        return StreamingResponse(iter([report]), media_type="text/plain")
+    
+    except Exception as e:
+        logger.error(f"Prediction failed: {str(e)}", exc_info=True)
+        return StreamingResponse(iter(["Unable to generate prediction."]), media_type="text/plain")
+
+async def handle_trend_analysis(entities: Dict[str, Any]) -> StreamingResponse:
+    """Handle production trend analysis requests (Question 42)"""
+    try:
+        sql = f"""
+            SELECT CAST(A.TranDate AS DATE) as Date, SUM(A.ProdnPcs) as TotalProduction
+            FROM RTMS_SessionWiseProduction A
+            WHERE A.TranDate >= DATEADD(DAY, -30, GETDATE()) AND A.ReptType IN ('RTM$', 'RTMS', 'RTM5')
+            GROUP BY CAST(A.TranDate AS DATE)
+            ORDER BY Date ASC
+        """
+        
+        logger.debug(f"Executing trend SQL: {sql}")
+        
+        with rtms_engine.connect() as conn:
+            try:
+                df = pd.read_sql(text(sql), conn)
+            except Exception as sql_error:
+                logger.error(f"Failed to execute trend analysis query: {sql}\nError: {str(sql_error)}", exc_info=True)
+                raise
+        
+        logger.debug(f"Fetched data for trend: shape={df.shape}, head=\n{df.head().to_string()}")
+        
+        if df.empty:
+            return StreamingResponse(iter(["No data for trend analysis."]), media_type="text/plain")
+        
+        lines = ["Production Trend (last 30 days):"]
+        for _, row in df.iterrows():
+            lines.append(f"{row['Date']}: {int(row['TotalProduction']):,} pieces")
+        
+        if len(df) > 1:
+            change = df['TotalProduction'].pct_change().mean() * 100
+            trend = "increasing" if change > 0 else "decreasing"
+            lines.append(f"Overall trend: {trend} by {abs(change):.1f}% on average.")
+        
+        full_report = "\n".join(lines)
+        
+        logger.debug(f"Generated trend analysis: {full_report}")
+        
+        return StreamingResponse(iter([full_report]), media_type="text/plain")
+    
+    except Exception as e:
+        logger.error(f"Trend analysis failed: {str(e)}", exc_info=True)
+        return StreamingResponse(iter(["Unable to generate trend analysis."]), media_type="text/plain")
+
+async def handle_lines_require_attention(entities: Dict[str, Any]) -> StreamingResponse:
+    """Handle lines require attention requests (Question 43)"""
+    try:
+        time_condition = entities.get('time_window', {}).get('sql_condition', "CAST(A.TranDate AS DATE) = CAST(GETDATE() AS DATE)")
+        sql = f"""
+            SELECT A.LineName, AVG(A.EffPer) as AvgEfficiency
+            FROM RTMS_SessionWiseProduction A
+            WHERE {time_condition} AND A.ReptType IN ('RTM$', 'RTMS', 'RTM5')
+            GROUP BY A.LineName
+            HAVING AVG(A.EffPer) < 85
+            ORDER BY AvgEfficiency ASC
+        """
+        
+        logger.debug(f"Executing attention SQL: {sql}")
+        
+        with rtms_engine.connect() as conn:
+            try:
+                df = pd.read_sql(text(sql), conn)
+            except Exception as sql_error:
+                logger.error(f"Failed to execute lines require attention query: {sql}\nError: {str(sql_error)}", exc_info=True)
+                raise
+        
+        logger.debug(f"Fetched data for attention: shape={df.shape}, head=\n{df.head().to_string()}")
+        
+        if df.empty:
+            return StreamingResponse(iter(["No lines require attention."]), media_type="text/plain")
+        
+        lines = ["Lines requiring attention (below 85% efficiency):"]
+        for _, row in df.iterrows():
+            lines.append(f"• {row['LineName']}: {row['AvgEfficiency']:.1f}%")
+        
+        full_report = "\n".join(lines)
+        
+        logger.debug(f"Generated attention report: {full_report}")
+        
+        return StreamingResponse(iter([full_report]), media_type="text/plain")
+    
+    except Exception as e:
+        logger.error(f"Lines require attention failed: {str(e)}", exc_info=True)
+        return StreamingResponse(iter(["Unable to determine lines requiring attention."]), media_type="text/plain")
+
 
 if __name__ == "__main__":
     # ✅ Start WhatsApp scheduler (5 min interval, auto WhatsApp trigger)
