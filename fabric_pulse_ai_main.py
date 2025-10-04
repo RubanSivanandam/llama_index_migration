@@ -1323,197 +1323,85 @@ async def get_efficiency_summary(
     line_name: str = Query(..., description="Line name"),
     part_name: str = Query(..., description="Part name"),
 ):
-    """
-    Cards data + underperformers (NoOfOperators) using CTE.
-    Date is FIXED to 2025-09-29 (for testing).
-    """
     try:
         if not rtms_engine or not rtms_engine.engine:
             raise HTTPException(status_code=500, detail="DB engine not available")
 
-        # Use a fixed date instead of GETDATE()
-        fixed_date = "2025-09-29"
-
-        cte_sql = text(f"""
-        ;WITH OperationDetails AS (
+        # Base SQL (no ISFinOper filter yet)
+        base_sql = """
             SELECT 
-                A.ReptType, 
-                A.UnitCode,
-                A.TranDate,
-                A.LineName,
-                B.SupervisorName,
-                B.SupervisorCode,
-                B.PhoneNumber,
-                A.PartName,
-                A.PartSeq,
-                SUM(A.PRODNPCS) AS ProdPcs,
-                COUNT(*) AS NoofOprs
-            FROM RTMS_SessionWiseProduction A
-            JOIN RTMS_SupervisorsDetl B
-                ON A.LineName = B.LineName
-               AND A.PartName = B.PartName
+                [LineName],
+                [EmpCode],
+                [EmpName],
+                [ProdnPcs],
+                [Eff100],
+                [EffPer],
+                [ISFinOper],
+                [IsRedFlag],
+                [TranDate],
+                [UnitCode],
+                [PartName],
+                [FloorName],
+                [Operation],
+                [NewOperSeq]
+            FROM [ITR_PRO_IND].[dbo].[RTMS_SessionWiseProduction]
             WHERE 
-                A.UnitCode = :unit_code
-                AND A.FloorName = :floor_name
-                AND A.LineName = :line_name
-                AND A.PartName = :part_name
-                AND CAST(A.TranDate AS DATE) = '{fixed_date}'
-                AND A.ReptType = 'RTM$'
-                AND A.ISFinPart = 'Y'
-            GROUP BY 
-                A.ReptType,
-                A.UnitCode,
-                A.TranDate,
-                A.LineName,
-                B.SupervisorName,
-                B.SupervisorCode,
-                B.PhoneNumber,
-                A.PartName,
-                A.PartSeq
-        ),
-        OperationSummary AS (
-            SELECT 
-                ReptType,
-                TranDate,
-                LineName,
-                PartSeq,
-                PartName,
-                Operation,
-                SUM(ProdnPcs) AS OperProd,
-                COUNT(DISTINCT EmpCode) AS NoofOperators,
-                ISFinPart
-            FROM dbo.RTMS_SessionWiseProduction 
-            WHERE CAST(TranDate AS DATE) = '{fixed_date}'
-              AND ReptType = 'RTM$'
-              AND UnitCode = :unit_code
-              AND FloorName = :floor_name
-              AND LineName = :line_name
-              AND PartName = :part_name
-            GROUP BY ReptType, TranDate, LineName, PartSeq, PartName, Operation, ISFinPart
-        ),
-        MaxProdPerPart AS (
-            SELECT 
-                ReptType,
-                TranDate,
-                LineName,
-                PartSeq,
-                PartName,
-                ISFinPart,
-                MAX(OperProd) AS MaxProd
-            FROM OperationSummary
-            GROUP BY ReptType, TranDate, LineName, PartSeq, PartName, ISFinPart
-        ),
-        LowPerformers AS (
-            SELECT 
-                a.ReptType,
-                a.TranDate,
-                a.LineName,
-                a.PartSeq,
-                a.PartName,
-                a.Operation,
-                a.OperProd,
-                b.MaxProd,
-                a.NoofOperators,
-                ROUND(b.MaxProd * 0.85, 0) AS TargetPcs,
-                ROUND((a.OperProd * 100.0) / b.MaxProd, 2) AS AchvPercent,
-                a.ISFinPart
-            FROM OperationSummary a
-            JOIN MaxProdPerPart b
-                ON a.ReptType = b.ReptType
-               AND a.TranDate = b.TranDate
-               AND a.LineName = b.LineName
-               AND a.PartSeq = b.PartSeq
-               AND a.PartName = b.PartName
-            WHERE a.OperProd < b.MaxProd * 0.85
-              AND a.ISFinPart = 'Y'
-        ),
-        SummaryTable AS (
-            SELECT 
-                ReptType,
-                TranDate,
-                LineName,
-                PartSeq,
-                PartName,
-                MAX(TargetPcs) AS TargetPcs,
-                MAX(AchvPercent) AS AchvPercent
-            FROM LowPerformers
-            GROUP BY ReptType, TranDate, LineName, PartSeq, PartName
-        )
-        SELECT 
-            OD.ReptType, OD.UnitCode, OD.TranDate, OD.LineName,
-            OD.SupervisorName, OD.SupervisorCode, OD.PhoneNumber,
-            OD.PartName, OD.PartSeq, OD.ProdPcs, OD.NoofOprs,
-            ST.TargetPcs, ST.AchvPercent
-        FROM OperationDetails OD
-        JOIN SummaryTable ST
-            ON OD.TranDate = ST.TranDate
-           AND OD.LineName = ST.LineName
-           AND OD.PartName = ST.PartName
-           AND OD.ReptType = ST.ReptType
-        ORDER BY OD.LineName, OD.PartSeq;
-        """)
+                [UnitCode] = :unit_code
+                AND [FloorName] = :floor_name
+                AND [LineName] = :line_name
+                AND [PartName] = :part_name
+                AND [ReptType] = 'RTM$'
+                AND CAST([TranDate] AS DATE) = CAST(GETDATE() AS DATE)
+        """
 
-        detail_sql = text(f"""
-            SELECT
-                A.EmpCode, A.EmpName, A.LineName, A.PartName,
-                A.UnitCode, A.FloorName,
-                A.NewOperSeq AS Operation,
-                A.ProdnPcs AS Production,
-                A.Eff100   AS Target,
-                CASE WHEN A.Eff100 > 0 THEN (A.ProdnPcs * 100.0) / A.Eff100 ELSE 0 END AS Efficiency,
-                B.SupervisorName, B.SupervisorCode, B.PhoneNumber
-            FROM RTMS_SessionWiseProduction A
-            JOIN RTMS_SupervisorsDetl B
-            ON A.LineName = B.LineName AND A.PartName = B.PartName
-            WHERE A.ReptType = 'RTM$'
-            AND CAST(A.TranDate AS DATE) = '{fixed_date}'
-            AND A.UnitCode = :unit_code
-            AND A.FloorName = :floor_name
-            AND A.LineName = :line_name
-            AND A.PartName = :part_name
-            AND A.ISFinPart = 'Y'
-            """)
-
+        sql_with_finoper = text(base_sql + " AND [ISFinOper] = 'Y'")
+        sql_without_finoper = text(base_sql)
 
         with rtms_engine.engine.connect() as conn:
-            df_cte = pd.read_sql(cte_sql, conn, params={
-                "unit_code": unit_code,
-                "floor_name": floor_name,
-                "line_name": line_name,
-                "part_name": part_name
-            })
-            df_emp = pd.read_sql(detail_sql, conn, params={
+            # Try with ISFinOper=Y
+            df = pd.read_sql(sql_with_finoper, conn, params={
                 "unit_code": unit_code,
                 "floor_name": floor_name,
                 "line_name": line_name,
                 "part_name": part_name
             })
 
-        total_production = int(df_cte["ProdPcs"].sum()) if not df_cte.empty else 0
-        total_target = int(df_cte["TargetPcs"].sum()) if not df_cte.empty else 0
-        efficiency = float((total_production / total_target) * 100.0) if total_target > 0 else 0.0
-        underperformers_count = int(df_cte["NoofOprs"].sum()) if not df_cte.empty else 0
+            # If no rows → retry without ISFinOper filter
+            if df.empty:
+                df = pd.read_sql(sql_without_finoper, conn, params={
+                    "unit_code": unit_code,
+                    "floor_name": floor_name,
+                    "line_name": line_name,
+                    "part_name": part_name
+                })
 
+        total_production = 0
+        total_target = 0
+        efficiency = 0.0
+
+        if not df.empty:
+            row_count = len(df)
+            total_production = int(df["ProdnPcs"].sum() / row_count) if row_count > 0 else 0
+            total_target = int(df["Eff100"].sum() / row_count) if row_count > 0 else 0
+            efficiency = float(df["EffPer"].mean()) if "EffPer" in df else 0.0
+
+        # Underperformers → IsRedFlag = 1
         underperformers = []
-        if not df_emp.empty:
-            df_u = df_emp[df_emp["Efficiency"] < 85.0]
-            for _, r in df_u.iterrows():
+        underperformers_count = 0
+        if not df.empty:
+            df_flagged = df[df["IsRedFlag"] == 1]
+            underperformers_count = len(df_flagged)
+            for _, r in df_flagged.iterrows():
                 underperformers.append({
-                "emp_code": str(r.EmpCode),
-                "emp_name": str(r.EmpName),
-                "unit_code": str(r.UnitCode),
-                "floor_name": str(r.FloorName),
-                "line_name": str(r.LineName),
-                "part_name": str(r.PartName),
-                "operation": str(r.Operation) if pd.notna(r.Operation) else None,
-                "production": int(r.Production) if pd.notna(r.Production) else 0,
-                "target": int(r.Target) if pd.notna(r.Target) else 0,
-                "efficiency": float(r.Efficiency) if pd.notna(r.Efficiency) else 0.0,
-                "supervisor_name": str(r.SupervisorName) if pd.notna(r.SupervisorName) else None,
-                "supervisor_code": str(r.SupervisorCode) if pd.notna(r.SupervisorCode) else None,
-                "phone_number": str(r.PhoneNumber) if pd.notna(r.PhoneNumber) else None,
-            })
-
+                    "emp_code": str(r.EmpCode),
+                    "emp_name": str(r.EmpName),
+                    "line_name": str(r.LineName),
+                    "part_name": str(r.PartName),
+                    "operation": str(r.Operation) if pd.notna(r.Operation) else None,
+                    "production": int(r.ProdnPcs) if pd.notna(r.ProdnPcs) else 0,
+                    "target": int(r.Eff100) if pd.notna(r.Eff100) else 0,
+                    "efficiency": float(r.EffPer) if pd.notna(r.EffPer) else 0.0,
+                })
 
         return {"success": True, "data": {
             "total_production": total_production,
@@ -1522,6 +1410,7 @@ async def get_efficiency_summary(
             "underperformers_count": underperformers_count,
             "underperformers": underperformers
         }}
+
     except Exception as e:
         logger.error(f"efficiency endpoint failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
@@ -1562,7 +1451,7 @@ async def get_flagged(
         LEFT JOIN RTMS_SupervisorsDetl B
           ON A.LineName = B.LineName AND A.PartName = B.PartName
         WHERE CAST(A.TranDate AS DATE) = :fixed_date
-          AND A.ReptType IN ('RTM$', 'RTMS', 'RTM5')
+          AND A.ReptType IN ('RTM$')
           AND A.UnitCode = :unit_code
           AND A.FloorName = :floor_name
           AND A.LineName = :line_name
@@ -1623,6 +1512,99 @@ async def get_flagged(
         })
 
     return {"success": True, "data": {"parts": parts_out}}
+
+@router.get("/api/rtms/operationWiseEmployees")
+async def get_operation_wise_employees(
+    unit_code: str = Query(..., description="Unit code"),
+    floor_name: str = Query(..., description="Floor name"),
+    line_name: str = Query(..., description="Line name"),
+    part_name: str = Query(..., description="Part name"),
+):
+    """
+    Fetch operation-wise employees for given Unit, Floor, Line, and Part.
+    Always uses today's date dynamically.
+    """
+    try:
+        if not rtms_engine or not rtms_engine.engine:
+            raise HTTPException(status_code=500, detail="DB engine not available")
+
+        sql = text("""
+            SELECT 
+                [LineName],
+                [EmpCode],
+                [EmpName],
+                [DeviceID],
+                [StyleNo],
+                [OrderNo],
+                [Operation],
+                [SAM],
+                [Eff100],
+                [Eff75],
+                [ProdnPcs],
+                [EffPer],
+                [OperSeq],
+                [UsedMin],
+                [S01],[S02],[S03],[S04],[S05],[S06],
+                [S07],[S08],[S09],[S10],[S11],[S12],
+                [TranDate],
+                [UnitCode],
+                [PartName],
+                [FloorName],
+                [ReptType],
+                [PartSeq],
+                [EffPer100],
+                [EffPer75],
+                [RowId],
+                [Operationseq],
+                [PartsSeq],
+                [NewOperSeq],
+                [BuyerCode],
+                [ISFinPart],
+                [ISFinOper],
+                [IsRedFlag]
+            FROM [ITR_PRO_IND].[dbo].[RTMS_SessionWiseProduction]
+            WHERE [UnitCode] = :unit_code
+              AND [FloorName] = :floor_name
+              AND [LineName] = :line_name
+              AND [PartName] = :part_name
+              AND CAST([TranDate] AS DATE) = CAST(GETDATE() AS DATE)
+            ORDER BY [TranDate] DESC
+        """)
+
+        with rtms_engine.engine.connect() as conn:
+            df = pd.read_sql(
+                sql, conn,
+                params={
+                    "unit_code": unit_code,
+                    "floor_name": floor_name,
+                    "line_name": line_name,
+                    "part_name": part_name
+                }
+            )
+
+        if df.empty:
+            return {
+                "success": True,
+                "data": [],
+                "message": "No employees found for the given filters today."
+            }
+
+        return {
+            "success": True,
+            "count": len(df),
+            "data": df.to_dict(orient="records"),
+            "filters_applied": {
+                "unit_code": unit_code,
+                "floor_name": floor_name,
+                "line_name": line_name,
+                "part_name": part_name,
+                "date": date.today().strftime("%Y-%m-%d")
+            }
+        }
+
+    except Exception as e:
+        logger.error(f"operationWiseEmployees failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to fetch operation-wise employees")
 
 # Health check
 @app.get("/health")
@@ -2641,12 +2623,12 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ====================== DATABASE CONFIGURATION ======================
-from sqlalchemy import create_engine
+# from sqlalchemy import create_engine
 
-DATABASE_URL = os.getenv("DATABASE_URL")
-rtms_engine = create_engine(
-    f"mssql+pyodbc://{DB_USERNAME}:{DB_PASSWORD}@{DB_SERVER}/{DB_DATABASE}?driver=ODBC+17+for+SQL+Server")
-logger.info("✅ Database engine created successfully")
+# DATABASE_URL = os.getenv("DATABASE_URL")
+# rtms_engine = create_engine(
+#     f"mssql+pyodbc://{DB_USERNAME}:{DB_PASSWORD}@{DB_SERVER}/{DB_DATABASE}?driver=ODBC+17+for+SQL+Server")
+# logger.info("✅ Database engine created successfully")
 
 # ====================== ENHANCED INTENT DETECTION ======================
 def detect_intent(query: str) -> Tuple[str, Dict[str, Any]]:

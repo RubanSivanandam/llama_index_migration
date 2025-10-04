@@ -22,6 +22,7 @@ from fabric_pulse_ai_main import (
     generate_pdf_report_api,
     get_efficiency_summary,
     get_flagged,
+    get_operation_wise_employees,
     get_parts,
     predict_efficiency,
     refresh_ai_cache,
@@ -94,6 +95,7 @@ app.get("/api/rtms/efficiency")(get_efficiency_summary)
 app.get("/api/ai/generate_hourly_report")(generate_hourly_report)
 app.get("/api/reports/hourly_pdf")(generate_pdf_report_api)
 app.get("/api/rtms/flagged")(get_flagged)
+app.get("/api/rtms/operationWiseEmployees")(get_operation_wise_employees)
 app.get("/health")(health_check)
 
 # 🔗 Aliases so frontend calls like /api/ai/rtms/... work too
